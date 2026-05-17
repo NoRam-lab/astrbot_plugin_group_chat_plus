@@ -63,13 +63,32 @@ const SessionMgr = {
 
         // 列表头部：刷新按钮
         const header = document.createElement('div');
-        header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:16px 24px 8px;';
-        header.innerHTML = `<span style="font-size:13px;color:var(--text-muted);">共 ${this._sessions.length} 个会话</span>`;
+        header.style.cssText = 'display:flex;flex-direction:column;gap:8px;padding:16px 24px 8px;';
+
+        const headerTop = document.createElement('div');
+        headerTop.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;';
+        headerTop.innerHTML = `<span style="font-size:13px;color:var(--text-muted);">共 ${this._sessions.length} 个会话</span>`;
         const refreshBtn = document.createElement('button');
         refreshBtn.className = 'btn btn-sm';
         refreshBtn.textContent = '刷新列表';
         refreshBtn.addEventListener('click', () => this._loadSessions());
-        header.appendChild(refreshBtn);
+        headerTop.appendChild(refreshBtn);
+
+        const ghostCount = this._sessions.filter(s => !s.has_runtime_data && s.has_file).length;
+        if (ghostCount > 0) {
+            const cleanupBtn = document.createElement('button');
+            cleanupBtn.className = 'btn btn-sm btn-danger';
+            cleanupBtn.textContent = `清理孤立记录 (${ghostCount})`;
+            cleanupBtn.title = '删除没有对应运行时状态的会话文件';
+            cleanupBtn.addEventListener('click', () => this._cleanupGhostSessions());
+            headerTop.appendChild(cleanupBtn);
+        }
+        header.appendChild(headerTop);
+
+        const storageHint = document.createElement('div');
+        storageHint.style.cssText = 'font-size:12px;color:var(--text-secondary);line-height:1.7;';
+        storageHint.innerHTML = '这里展示的是同一批真实会话：<strong>聊天记录文件</strong>来自插件自定义存储 <code>chat_history/...</code>，<strong>运行时状态</strong>来自当前内存；官方存储仍会同步写入，并在部分场景作为历史读取回退。正常情况下它们应归并到同一个会话，而不是拆成多个。';
+        header.appendChild(storageHint);
         container.appendChild(header);
 
         if (!this._sessions.length) {
@@ -201,7 +220,7 @@ const SessionMgr = {
     /** 构建详情 DOM */
     _buildDetailDOM(container, d, sessionId) {
         container.innerHTML = '';
-        container.style.cssText = 'padding:24px;overflow-y:auto;display:flex;flex-direction:column;';
+        container.style.cssText = 'padding:24px;overflow-y:auto;display:flex;flex-direction:column;min-height:0;height:100%;';
 
         // 头部
         const header = document.createElement('div');
@@ -247,6 +266,12 @@ const SessionMgr = {
         headerActions.appendChild(backBtn);
         header.appendChild(headerActions);
         container.appendChild(header);
+
+        // 详情头部说明
+        const storageHint = document.createElement('div');
+        storageHint.style.cssText = 'font-size:12px;color:var(--text-secondary);line-height:1.7;margin-bottom:12px;';
+        storageHint.innerHTML = '本页会把<strong>插件自定义聊天记录文件</strong>与<strong>当前运行时状态</strong>合并展示；官方存储仍会同步写入，并在部分场景作为历史读取回退，因此正常情况下这些信息应属于同一个会话。';
+        container.appendChild(storageHint);
 
         // 概览卡片
         const cards = document.createElement('div');
@@ -329,7 +354,8 @@ const SessionMgr = {
             { label: '处理中', value: d.is_processing ? '是' : '否', id: 'ov-processing' },
             { label: '主动处理', value: d.proactive_processing ? '是' : '否', id: 'ov-pro-proc' },
             { label: '等待窗口', value: (d.wait_windows || []).length, id: 'ov-wait' },
-            { label: '冷却用户', value: (d.cooldowns || []).length, id: 'ov-cooldown' },
+            { label: '正式冷却', value: (d.cooldowns || []).length, id: 'ov-cooldown' },
+            { label: '待冷却', value: (d.pending_cooldowns || []).length, id: 'ov-pending-cooldown' },
             { label: '疲劳锁定', value: (d.fatigue_blocks || []).length, id: 'ov-fatigue' },
             { label: '回复密度', value: density.reply_count !== undefined ? `${density.reply_count}/${density.max_replies || '-'}` : '-', id: 'ov-density' },
             { label: '活跃度', value: typeof activity.activity_score === 'number' ? activity.activity_score.toFixed(2) : '-', id: 'ov-activity' },
@@ -384,10 +410,15 @@ const SessionMgr = {
         const p = d.probability || {};
         container.innerHTML = '';
 
+        const isTraditional = (p.mode || 'traditional') === 'traditional';
+        const modeLabel = isTraditional ? '传统模式' : '注意力模式';
+
         const items = [
             { label: '基础概率', value: p.initial_probability, color: '' },
-            { label: '回复后概率', value: p.after_reply_probability, color: 'green' },
         ];
+        if (isTraditional) {
+            items.push({ label: '回复后概率', value: p.after_reply_probability, color: 'green' });
+        }
         if (p.frequency_adjusted_probability !== undefined) {
             items.push({ label: '频率调整后', value: p.frequency_adjusted_probability, color: 'orange' });
         }
@@ -397,6 +428,13 @@ const SessionMgr = {
                 value: p.temp_boost.value, color: 'purple'
             });
         }
+
+        const note = document.createElement('div');
+        note.style.cssText = 'font-size:12px;color:var(--text-secondary);margin-bottom:10px;line-height:1.6;';
+        note.innerHTML = isTraditional
+            ? `当前为<strong>${modeLabel}</strong>：成功回复后会在 <strong>${p.probability_duration || 0}s</strong> 内为整个会话临时提高概率；该提升不区分用户，并且再次成功回复会刷新计时。`
+            : `当前为<strong>${modeLabel}</strong>：回复后概率提升已由注意力机制接管，<strong>after_reply_probability</strong> 不再参与当前会话计算。`;
+        container.appendChild(note);
 
         const grid = document.createElement('div');
         grid.id = 'prob-grid';
@@ -429,8 +467,8 @@ const SessionMgr = {
 
         const isActive = p.proactive_active || false;
         const cooldown = p.cooldown_remaining || 0;
-        const totalSuccess = p.total_successes || 0;
-        const totalFailure = p.total_failures || 0;
+        const totalSuccess = p.successful_interactions || 0;
+        const totalFailure = p.failed_interactions || 0;
         const total = totalSuccess + totalFailure;
         const rate = total > 0 ? ((totalSuccess / total) * 100).toFixed(1) : '0.0';
         const score = typeof p.interaction_score === 'number' ? p.interaction_score.toFixed(1) : '-';
@@ -517,10 +555,12 @@ const SessionMgr = {
         }
         wrap.appendChild(waitSection);
 
-        // 冷却用户
+        // 正式冷却 / 待冷却
         const cooldowns = d.cooldowns || [];
+        const pendingCooldowns = d.pending_cooldowns || [];
         const coolSection = document.createElement('div');
-        coolSection.innerHTML = `<h4 style="margin:0 0 8px;font-size:13px;color:var(--text-secondary);">冷却中用户 (${cooldowns.length})</h4>`;
+        coolSection.innerHTML = `<h4 style="margin:0 0 8px;font-size:13px;color:var(--text-secondary);">正式冷却用户 (${cooldowns.length})</h4>`;
+        coolSection.innerHTML += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">正式冷却会冻结该用户的注意力增长；若用户已不在注意力追踪列表中，会被自动移出冷却名单。</div>';
         if (cooldowns.length) {
             const table = document.createElement('table');
             table.className = 'data-table';
@@ -537,9 +577,33 @@ const SessionMgr = {
             table.appendChild(tbody);
             coolSection.appendChild(table);
         } else {
-            coolSection.innerHTML += '<div style="font-size:12px;color:var(--text-muted);">无冷却中用户</div>';
+            coolSection.innerHTML += '<div style="font-size:12px;color:var(--text-muted);">无正式冷却用户</div>';
         }
         wrap.appendChild(coolSection);
+
+        const pendingSection = document.createElement('div');
+        pendingSection.innerHTML = `<h4 style="margin:12px 0 8px;font-size:13px;color:var(--text-secondary);">待冷却用户 (${pendingCooldowns.length})</h4>`;
+        pendingSection.innerHTML += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">待冷却只观察同一用户自己的后续消息；如果该用户已经不在注意力追踪列表中，会直接从待冷却名单移除，不再推进到正式冷却。</div>';
+        if (pendingCooldowns.length) {
+            const table = document.createElement('table');
+            table.className = 'data-table';
+            table.innerHTML = `<thead><tr><th>用户</th><th>名称</th><th>剩余</th><th>观察</th><th>原因</th></tr></thead>`;
+            const tbody = document.createElement('tbody');
+            pendingCooldowns.forEach(c => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td style="font-family:monospace;font-size:11px;">${Utils.escapeHtml(c.user_id)}</td>` +
+                    `<td>${Utils.escapeHtml(c.user_name || '-')}</td>` +
+                    `<td>${Utils.formatDuration(c.remaining || 0)}</td>` +
+                    `<td>${Utils.escapeHtml(`${c.consumed_user_messages || 0}/${c.grace_message_budget || 0}`)}</td>` +
+                    `<td>${Utils.escapeHtml(c.reason || '-')}</td>`;
+                tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+            pendingSection.appendChild(table);
+        } else {
+            pendingSection.innerHTML += '<div style="font-size:12px;color:var(--text-muted);">无待冷却用户</div>';
+        }
+        wrap.appendChild(pendingSection);
 
         // 疲劳锁定
         const fatigueBlocks = d.fatigue_blocks || [];
@@ -633,7 +697,12 @@ const SessionMgr = {
         container.innerHTML = '<div class="chart-empty">加载中...</div>';
 
         const res = await Api.getChatHistory(sessionId);
-        const messages = (res.ok && res.messages) ? res.messages : [];
+        if (!res.ok) {
+            container.innerHTML = `<div class="chart-empty">${Utils.escapeHtml(res.msg || '加载失败')}</div>`;
+            this._historyLoaded = false;
+            return;
+        }
+        const messages = res.messages || [];
         this._historyLoaded = true;
 
         container.innerHTML = '';
@@ -686,7 +755,7 @@ const SessionMgr = {
         container.innerHTML = '';
 
         const editor = document.createElement('div');
-        editor.className = 'file-editor';
+        editor.className = 'file-editor file-editor--history';
 
         const editorHeader = document.createElement('div');
         editorHeader.className = 'file-editor-header';
@@ -732,11 +801,21 @@ const SessionMgr = {
         editor.appendChild(editorHeader);
 
         const textarea = document.createElement('textarea');
-        textarea.className = 'file-editor textarea';
-        textarea.style.cssText = 'font-family:monospace;font-size:12px;min-height:400px;width:100%;margin-top:8px;';
+        textarea.className = 'file-editor-textarea';
+        textarea.style.cssText = 'font-family:monospace;font-size:12px;width:100%;margin-top:8px;';
         textarea.value = JSON.stringify(messages, null, 2);
-        editor.appendChild(textarea);
 
+        const ensureVisibleOnMobile = () => {
+            if (window.innerWidth >= 768) return;
+            requestAnimationFrame(() => {
+                textarea.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+            });
+        };
+
+        textarea.addEventListener('focus', ensureVisibleOnMobile);
+        textarea.addEventListener('click', ensureVisibleOnMobile);
+
+        editor.appendChild(textarea);
         container.appendChild(editor);
     },
 
@@ -757,6 +836,7 @@ const SessionMgr = {
             ['ov-pro-proc', d.proactive_processing ? '是' : '否', prev.proactive_processing ? '是' : '否'],
             ['ov-wait', (d.wait_windows || []).length, (prev.wait_windows || []).length],
             ['ov-cooldown', (d.cooldowns || []).length, (prev.cooldowns || []).length],
+            ['ov-pending-cooldown', (d.pending_cooldowns || []).length, (prev.pending_cooldowns || []).length],
             ['ov-fatigue', (d.fatigue_blocks || []).length, (prev.fatigue_blocks || []).length],
             ['ov-density', density.reply_count !== undefined ? `${density.reply_count}/${density.max_replies || '-'}` : '-',
              prevDensity.reply_count !== undefined ? `${prevDensity.reply_count}/${prevDensity.max_replies || '-'}` : '-'],
@@ -801,6 +881,26 @@ const SessionMgr = {
         document.getElementById('session-detail').classList.add('hidden');
         document.getElementById('session-list-container').classList.remove('hidden');
         this._loadSessions();
+    },
+
+    /** 清理孤立会话文件 */
+    async _cleanupGhostSessions() {
+        const ghostCount = this._sessions.filter(s => !s.has_runtime_data && s.has_file).length;
+        if (ghostCount === 0) {
+            Utils.toast('没有需要清理的孤立会话记录', 'info');
+            return;
+        }
+        const ok = await Utils.confirm(
+            `确认清理 ${ghostCount} 个孤立会话的文件记录？\n\n这些会话没有对应的运行时状态，可能是旧版留下的残留文件。\n清理后无法恢复，请确认是否继续。`
+        );
+        if (!ok) return;
+        const res = await Api.sessionCleanGhosts();
+        if (res.ok) {
+            Utils.toast(res.msg || '清理完成', 'success');
+            this._loadSessions();
+        } else {
+            Utils.toast(res.msg || '清理失败', 'error');
+        }
     },
 
     /** 重置会话数据 */

@@ -169,7 +169,8 @@ const Charts = {
                 { label: '主动对话', value: d.proactive_active_count || 0, id: 'ov-proactive' },
                 { label: '缓存消息', value: sd.message_cache_count ?? d.total_cached_messages ?? 0, id: 'ov-cached-msgs' },
                 { label: '等待窗口', value: sd.wait_windows ? sd.wait_windows.length : (d.active_wait_windows || 0), id: 'ov-wait-wins' },
-                { label: '冷却用户', value: sd.cooldowns ? sd.cooldowns.length : (d.cooldown_users || 0), id: 'ov-cooldown-users' },
+                { label: '正式冷却', value: sd.cooldowns ? sd.cooldowns.length : (d.cooldown_users || 0), id: 'ov-cooldown-users' },
+                { label: '待冷却', value: sd.pending_cooldowns ? sd.pending_cooldowns.length : (d.pending_cooldown_users || 0), id: 'ov-pending-cooldown-users' },
                 { label: '主动处理', value: sd.proactive_processing !== undefined ? (sd.proactive_processing ? '是' : '否') : (d.proactive_processing || 0), id: 'ov-pro-processing' },
             ];
 
@@ -236,14 +237,25 @@ const Charts = {
             }
 
             const { labels, values } = this._probLabelsValues(d);
+            const modeNote = document.createElement('div');
+            modeNote.style.cssText = 'font-size:12px;color:var(--text-secondary);margin-bottom:10px;line-height:1.6;';
+            modeNote.innerHTML = (d.mode || 'traditional') === 'traditional'
+                ? `当前为<strong>传统模式</strong>：回复后概率提升按整个会话计算，持续 <strong>${d.probability_duration || 0}s</strong>，再次成功回复会刷新计时。`
+                : `当前为<strong>注意力模式</strong>：回复后加成已由注意力机制按用户接管，<strong>after_reply_probability</strong> 不参与当前会话计算。`;
+            card.appendChild(modeNote);
             this._drawBarChart(canvas, labels, values, 'var(--text-primary)');
 
             const stats = document.createElement('div');
             stats.className = 'stats-row';
             stats.id = 'stats-probability';
+            const mode = (d.mode || 'traditional') === 'traditional' ? '传统模式' : '注意力模式';
+            const replyStat = (d.mode || 'traditional') === 'traditional'
+                ? `<div class="stat-item"><div class="stat-value" id="prob-reply">${((d.after_reply_probability || 0) * 100).toFixed(1)}%</div><div class="stat-label">回复后概率</div></div>`
+                : `<div class="stat-item"><div class="stat-value" id="prob-reply">由注意力接管</div><div class="stat-label">回复后加成</div></div>`;
             stats.innerHTML = `
                 <div class="stat-item"><div class="stat-value" id="prob-init">${((d.initial_probability || 0) * 100).toFixed(1)}%</div><div class="stat-label">基础概率</div></div>
-                <div class="stat-item"><div class="stat-value" id="prob-reply">${((d.after_reply_probability || 0) * 100).toFixed(1)}%</div><div class="stat-label">回复后概率</div></div>`;
+                ${replyStat}
+                <div class="stat-item"><div class="stat-value" id="prob-mode">${mode}</div><div class="stat-label">当前模式</div></div>`;
             card.appendChild(stats);
 
             this._prevData['prob-data'] = values.join(',');
@@ -292,12 +304,13 @@ const Charts = {
             );
 
             const proactive = res && res.ok ? (res.proactive || {}) : {};
-            if (!Object.keys(proactive).length) {
+            const filtered = this._filterProactiveBySession(proactive);
+            if (!Object.keys(filtered).length) {
                 wrap.innerHTML = '<div class="chart-empty">暂无主动对话数据</div>';
                 return;
             }
 
-            const { totalSuccess, totalFailure, totalCooldown, rate, avgScore } = this._calcProactive(proactive);
+            const { totalSuccess, totalFailure, totalCooldown, rate, avgScore } = this._calcProactive(filtered);
             this._drawBarChart(canvas, ['成功', '失败', '冷却中'], [totalSuccess, totalFailure, totalCooldown], 'var(--accent-green)');
 
             const stats = document.createElement('div');
@@ -332,6 +345,7 @@ const Charts = {
             'ov-cached-msgs': sd.message_cache_count ?? d.total_cached_messages ?? 0,
             'ov-wait-wins': sd.wait_windows ? sd.wait_windows.length : (d.active_wait_windows || 0),
             'ov-cooldown-users': sd.cooldowns ? sd.cooldowns.length : (d.cooldown_users || 0),
+            'ov-pending-cooldown-users': sd.pending_cooldowns ? sd.pending_cooldowns.length : (d.pending_cooldown_users || 0),
             'ov-pro-processing': sd.proactive_processing !== undefined ? (sd.proactive_processing ? '是' : '否') : (d.proactive_processing || 0),
         };
         for (const [id, val] of Object.entries(map)) {
@@ -380,9 +394,13 @@ const Charts = {
             }
 
             const initVal = ((d.initial_probability || 0) * 100).toFixed(1) + '%';
-            const replyVal = ((d.after_reply_probability || 0) * 100).toFixed(1) + '%';
+            const replyVal = (d.mode || 'traditional') === 'traditional'
+                ? ((d.after_reply_probability || 0) * 100).toFixed(1) + '%'
+                : '由注意力接管';
+            const modeVal = (d.mode || 'traditional') === 'traditional' ? '传统模式' : '注意力模式';
             this._setTextIfChanged('prob-init', initVal);
             this._setTextIfChanged('prob-reply', replyVal);
+            this._setTextIfChanged('prob-mode', modeVal);
         } catch (e) { console.error('Charts: probability update failed', e); }
     },
 
@@ -412,9 +430,10 @@ const Charts = {
     _updateProactive(res) {
         try {
             const proactive = res && res.ok ? (res.proactive || {}) : {};
-            if (!Object.keys(proactive).length) return;
+            const filtered = this._filterProactiveBySession(proactive);
+            if (!Object.keys(filtered).length) return;
 
-            const { totalSuccess, totalFailure, totalCooldown, rate, avgScore } = this._calcProactive(proactive);
+            const { totalSuccess, totalFailure, totalCooldown, rate, avgScore } = this._calcProactive(filtered);
             const key = `${totalSuccess},${totalFailure},${totalCooldown}`;
 
             const canvas = document.querySelector('#chart-proactive canvas');
@@ -444,8 +463,12 @@ const Charts = {
 
     /** 提取概率图的 labels/values */
     _probLabelsValues(d) {
-        const labels = ['基础概率', '回复后概率'];
-        const values = [d.initial_probability || 0, d.after_reply_probability || 0];
+        const labels = ['基础概率'];
+        const values = [d.initial_probability || 0];
+        if ((d.mode || 'traditional') === 'traditional') {
+            labels.push('回复后概率');
+            values.push(d.after_reply_probability || 0);
+        }
         if (d.frequency_adjusted_probability !== undefined) {
             labels.push('频率调整');
             values.push(d.frequency_adjusted_probability || 0);
@@ -455,6 +478,21 @@ const Charts = {
             values.push(d.temp_boost.value || 0);
         }
         return { labels, values };
+    },
+
+    /** 按当前选中会话过滤主动对话数据（key 格式匹配，兼容复合/非复合 key） */
+    _filterProactiveBySession(proactive) {
+        if (!this._session) return proactive;
+        const sessionParts = this._session.split('_');
+        const targetCid = sessionParts.length >= 3 ? sessionParts.slice(2).join('_') : this._session;
+
+        for (const [key, state] of Object.entries(proactive)) {
+            if (key === this._session) return { [key]: state };
+            const keyParts = key.split('_');
+            const keyCid = keyParts.length >= 3 ? keyParts.slice(2).join('_') : key;
+            if (keyCid === targetCid) return { [key]: state };
+        }
+        return {};
     },
 
     /** 计算主动对话汇总 */
@@ -506,7 +544,7 @@ const Charts = {
         const ctx = canvas.getContext('2d');
         ctx.scale(dpr, dpr);
         const w = rect.width, h = rect.height;
-        const pad = { top: 10, right: 10, bottom: 40, left: 50 };
+        const pad = { top: 22, right: 10, bottom: 40, left: 50 };
         const chartW = w - pad.left - pad.right;
         const chartH = h - pad.top - pad.bottom;
 
@@ -540,13 +578,14 @@ const Charts = {
             ctx.fillStyle = textMuted;
             ctx.font = '10px sans-serif';
             ctx.textAlign = 'right';
-            const label = (max * i / 4).toFixed(max < 1 ? 2 : 0);
-            ctx.fillText(label, pad.left - 6, y + 3);
+            const v = (max * i / 4).toFixed(max < 1 ? 2 : 0);
+            ctx.fillText(v, pad.left - 6, y + 3);
         }
 
         // 柱子
         const barW = Math.min(40, chartW / labels.length * 0.6);
         const gap = chartW / labels.length;
+        const barRects = [];
 
         labels.forEach((label, i) => {
             const x = pad.left + gap * i + (gap - barW) / 2;
@@ -572,6 +611,76 @@ const Charts = {
             ctx.font = '11px sans-serif';
             const vt = values[i] < 1 ? values[i].toFixed(2) : String(Math.round(values[i]));
             ctx.fillText(vt, pad.left + gap * i + gap / 2, y - 4);
+
+            barRects.push({ x, w: barW, label });
         });
+
+        // 存储柱位置用于 tooltip 碰撞检测
+        canvas._barRects = barRects;
+        this._ensureTooltip(canvas);
+    },
+
+    /** 为柱状图 canvas 绑定 tooltip（hover + touch，仅绑一次） */
+    _ensureTooltip(canvas) {
+        if (canvas._tooltipBound) return;
+        canvas._tooltipBound = true;
+
+        const wrap = canvas.parentElement;
+        let tooltip = wrap.querySelector('.chart-tooltip');
+        if (!tooltip) {
+            tooltip = document.createElement('div');
+            tooltip.className = 'chart-tooltip';
+            tooltip.style.cssText =
+                'position:absolute;z-index:50;padding:4px 8px;background:var(--bg-card);' +
+                'color:var(--text-primary);font-size:11px;font-family:monospace;' +
+                'border:1px solid var(--border-color);border-radius:4px;' +
+                'pointer-events:none;white-space:nowrap;display:none;' +
+                'box-shadow:0 2px 8px rgba(0,0,0,0.35);';
+            wrap.appendChild(tooltip);
+        }
+
+        const showAt = (clientX, clientY, text) => {
+            const wr = wrap.getBoundingClientRect();
+            tooltip.textContent = text;
+            let left = clientX - wr.left - tooltip.offsetWidth / 2;
+            left = Math.max(4, Math.min(left, wr.width - tooltip.offsetWidth - 4));
+            tooltip.style.left = left + 'px';
+            tooltip.style.top = Math.max(0, clientY - wr.top - 32) + 'px';
+            tooltip.style.display = 'block';
+        };
+
+        const hide = () => { tooltip.style.display = 'none'; };
+
+        const hitTest = (clientX, clientY) => {
+            const cr = canvas.getBoundingClientRect();
+            const mx = clientX - cr.left;
+            for (const r of canvas._barRects || []) {
+                if (mx >= r.x && mx <= r.x + r.w) return r;
+            }
+            return null;
+        };
+
+        canvas.addEventListener('mousemove', (e) => {
+            const hit = hitTest(e.clientX, e.clientY);
+            hit ? showAt(e.clientX, e.clientY, hit.label) : hide();
+        });
+        canvas.addEventListener('mouseleave', hide);
+
+        // 触摸：点击柱区域显示，点空白/外部消失
+        let _touchActive = false;
+        canvas.addEventListener('click', (e) => {
+            const hit = hitTest(e.clientX, e.clientY);
+            if (hit) {
+                _touchActive = true;
+                showAt(e.clientX, e.clientY, hit.label);
+                e.stopPropagation();
+            } else {
+                _touchActive = false;
+                hide();
+            }
+        });
+        document.addEventListener('click', (ev) => {
+            if (_touchActive && ev.target !== canvas) { _touchActive = false; hide(); }
+        }, true);
     }
 };

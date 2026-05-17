@@ -3,21 +3,21 @@
 负责调用AI生成回复
 
 作者: Him666233
-版本: v1.2.1
+版本: v1.2.2
 
 v1.2.0 更新：
 - 改用 event.request_llm() 替代 provider.text_chat()，支持其他插件的钩子注入
 - 添加标记机制，让 main.py 的 on_llm_request 钩子能识别并处理上下文
 """
 
-import asyncio
 from datetime import datetime
 from astrbot.api.all import *
 from astrbot.api.event import AstrMessageEvent
+from ...utils.ai_error_formatter import format_ai_error
+from astrbot.core.provider.entities import ProviderRequest
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
-from astrbot.core.provider.entities import ProviderRequest
 
 # 🆕 v1.2.0: 标记键名，用于标识请求来自本插件
 PLUGIN_REQUEST_MARKER = "_group_chat_plus_request"
@@ -33,6 +33,8 @@ PLUGIN_IMAGE_URLS = "_group_chat_plus_image_urls"
 PLUGIN_FUNC_TOOL = "_group_chat_plus_func_tool"
 # 🔧 存储当前用户消息原文（短字符串），用于向量检索类插件（如 livingmemory）的记忆召回
 PLUGIN_CURRENT_MESSAGE = "_group_chat_plus_current_message"
+# 🆕 v1.2.2: 存储插件静态系统指令，由 on_llm_request 追加到 system_prompt 末尾
+PLUGIN_CUSTOM_STATIC_INSTRUCTIONS = "_group_chat_plus_static_instructions"
 
 
 class ReplyHandler:
@@ -107,18 +109,19 @@ class ReplyHandler:
 - [戳过对方提示]：你刚戳过对方，供参考理解上下文，禁止提及
 - [表情包图片]：该消息附带的图片是表情包/贴纸，不是普通照片。你可以看懂图片来理解其传达的情绪和幽默感，但回应时像真人一样自然——有时共鸣、有时吐槽、有时忽略，不要描述或复述图片内容（如"图上画了..."），也不要说"你发了表情包"
 - [系统提示]中若出现「请你像真人一样判断这个情况」：
-  ✅ 这是空@场景——真正用脑子判断！看清楚那几条消息是谁发的、说了什么，再看看@你的这个人之前有没有提过相关的事
+  ✅ 这表示对方发来的是单独的、不包含任何信息的 @ 消息——真正用脑子判断！看清楚那几条消息是谁发的、说了什么，再看看@你的这个人之前有没有提过相关的事
   ✅ 如果判断对方只是随便叫一声、或者你不确定ta想要什么：直接自然地回一句「？」或「怎么了」就好，**不要强行接那几条消息**
   ✅ 如果判断对方确实想让你回应上面那些内容：再去回应
   ❌ 禁止：不管三七二十一直接回答列出来的那几条消息——先判断意图！
 - [系统提示]中若出现「请仔细观察上下文和对话走向」：
   ✅ 这是关键词触发场景——真正看懂上下文再说话
   ✅ 结合发送者在聊什么、@了谁、整体走向来决定怎么回复，不要只因为检测到关键词就机械地回应
-- [转发消息]：这是一条合并转发消息。回复时注意：
+- [转发消息]：这是一条 QQ / OneBot 合并转发消息。回复时注意：
   * 不要逐条复述转发内容，自然地回应发送者分享这些消息的意图
   * 关注发送者转发消息的目的（分享、讨论、询问等）
   * 可以针对转发内容中感兴趣的部分做简短评论
   * 禁止说"我看到你转发了..."，直接自然回应内容
+  * 如果里面还有嵌套转发，系统可能已经在深度限制内展开；按最终展示出来的文本理解即可
   * 转发消息中"--- 转发内容 ---"和"--- 转发结束 ---"之间的是转发的原始消息内容
 
 【系统提示词说明】：
@@ -370,11 +373,23 @@ class ReplyHandler:
             func_tools_mgr = context.get_llm_tool_manager()
             plugin_tool_set = None
             try:
-                plugin_tool_set = func_tools_mgr.get_full_tool_set()
-                # 过滤未激活的工具（与平台 _ensure_persona_and_skills 行为一致）
-                for tool in list(plugin_tool_set.tools):
-                    if hasattr(tool, "active") and not tool.active:
-                        plugin_tool_set.remove_tool(tool.name)
+                if hasattr(func_tools_mgr, "get_full_tool_set"):
+                    plugin_tool_set = func_tools_mgr.get_full_tool_set()
+                else:
+                    plugin_tool_set = func_tools_mgr
+
+                # 过滤未激活的工具（兼容 ToolSet.tools / FunctionToolManager.func_list）
+                plugin_tools = getattr(plugin_tool_set, "tools", None)
+                if plugin_tools is None:
+                    plugin_tools = getattr(plugin_tool_set, "func_list", None)
+
+                if plugin_tools is not None:
+                    for tool in list(plugin_tools):
+                        if hasattr(tool, "active") and not tool.active:
+                            if hasattr(plugin_tool_set, "remove_tool"):
+                                plugin_tool_set.remove_tool(tool.name)
+                            elif hasattr(plugin_tool_set, "remove_func"):
+                                plugin_tool_set.remove_func(tool.name)
             except Exception:
                 pass
 
@@ -418,9 +433,10 @@ class ReplyHandler:
             except Exception as e:
                 logger.warning(f"获取人格设定失败: {e}，使用空人格")
 
-            # 如果有begin_dialogs，将其添加到prompt开头
+            # 如果有begin_dialogs，将其追加到prompt末尾（不破坏静态前缀缓存）
+            # 🔧 v1.2.2: 从 prompt 开头移到末尾
             if begin_dialogs_text:
-                full_prompt = begin_dialogs_text + full_prompt
+                full_prompt += begin_dialogs_text
 
             # 🆕 v1.2.0: 改用 event.request_llm() 替代 provider.text_chat()
             # 这样可以让其他插件（如 emotionai）的 on_llm_request 钩子生效
@@ -452,6 +468,21 @@ class ReplyHandler:
             event.set_extra(PLUGIN_CUSTOM_SYSTEM_PROMPT, system_prompt)
             # 存储插件自定义的完整 prompt（含历史上下文），供 on_llm_request 钩子恢复使用
             event.set_extra(PLUGIN_CUSTOM_PROMPT, full_prompt)
+            # 🆕 v1.2.2: 提取静态系统指令到独立 extra，由 on_llm_request 追加到 system_prompt
+            # 注意: full_prompt 中保留原静态前缀以作安全网（钩子失败时仍可用）
+            _reply_static_instructions = ReplyHandler.SYSTEM_REPLY_PROMPT
+            if extra_prompt and extra_prompt.strip():
+                _reply_static_instructions += (
+                    f"\n\n用户补充说明:\n{extra_prompt.strip()}\n"
+                )
+            _reply_static_instructions += ReplyHandler.SYSTEM_REPLY_PROMPT_ENDING
+            event.set_extra(
+                PLUGIN_CUSTOM_STATIC_INSTRUCTIONS, _reply_static_instructions
+            )
+            if DEBUG_MODE:
+                logger.info(
+                    f"已设置静态指令 extra，长度: {len(_reply_static_instructions)} 字符"
+                )
             # 存储图片 URL 列表
             event.set_extra(PLUGIN_IMAGE_URLS, image_urls)
             # 🔧 存储插件自身的工具集（ToolSet），用于在 on_llm_request 钩子中恢复
@@ -460,11 +491,16 @@ class ReplyHandler:
 
             # 🔧 提取当前用户消息原文（不含历史上下文），作为向量检索类插件的召回查询词
             current_message_for_retrieval = event.get_message_str() or ""
+            # 🔧 修复：单独无信息@消息时 get_message_str() 返回 ""，部分平台/框架收到空 prompt 会
+            # 跳过 LLM 调用，导致 on_llm_request 钩子不触发、AI 无回复。
+            # 用占位符替代空字符串；on_llm_request 钩子(-1优先级)会把 req.prompt 换回
+            # 完整的 full_prompt，此占位符不会被 AI 看到。
+            prompt_for_request = current_message_for_retrieval or "[空消息]"
             event.set_extra(PLUGIN_CURRENT_MESSAGE, current_message_for_retrieval)
 
             if DEBUG_MODE:
                 logger.info(
-                    f"🔧 [兼容模式] 已设置插件标记，将通过 event.request_llm() 调用 AI"
+                    "🔧 [兼容模式] 已设置插件标记，将通过 event.request_llm() 调用 AI"
                 )
                 logger.info(f"  - contexts 数量: {len(contexts)}")
                 logger.info(f"  - system_prompt 长度: {len(system_prompt)}")
@@ -481,8 +517,9 @@ class ReplyHandler:
             # 在新版 (>=4.14) 中被静默忽略。保留此参数以确保旧版兼容。
             # 新版的工具注入问题由 on_llm_request 钩子中恢复 plugin_tool_set 来解决。
             return event.request_llm(
-                prompt=current_message_for_retrieval,
+                prompt=prompt_for_request,
                 func_tool_manager=func_tools_mgr,
+                tool_set=plugin_tool_set,
                 session_id=event.session_id,
                 image_urls=image_urls,
                 contexts=contexts,
@@ -490,9 +527,11 @@ class ReplyHandler:
             )
 
         except Exception as e:
-            logger.error(f"生成AI回复时发生错误: {e}")
+            logger.error(f"{format_ai_error(e, '私信-生成AI回复')}")
             # 返回错误消息
-            return event.plain_result(f"生成回复时发生错误: {str(e)}")
+            return event.plain_result(
+                f"生成回复时发生错误: {format_ai_error(e, '私信-生成AI回复')}"
+            )
 
     @staticmethod
     def check_if_already_replied(event: AstrMessageEvent) -> bool:

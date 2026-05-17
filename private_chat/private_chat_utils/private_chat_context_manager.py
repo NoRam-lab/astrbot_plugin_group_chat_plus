@@ -10,16 +10,16 @@
 - 详细的保存日志便于调试
 
 作者: Him666233
-版本: v1.2.1
+版本: v1.2.2
 """
 
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from astrbot.api.all import *
 from astrbot.api.message_components import Plain
-import os
 import json
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime
 from ._session_guard import guard_session
 
 # 导入群聊 ContextManager 的历史截止时间戳机制（共享同一份持久化数据）
@@ -29,7 +29,6 @@ from ...utils.context_manager import ContextManager as _GroupContextManager
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .message_cleaner import MessageCleaner
     from astrbot.core.star.context import Context
     from astrbot.core.db.po import PlatformMessageHistory
 
@@ -46,6 +45,10 @@ class ContextManager:
     2. 控制上下文消息数量
     3. 格式化成AI可理解的文本
     """
+
+    @staticmethod
+    def _coerce_plain_text(value: Any) -> str:
+        return _GroupContextManager._coerce_plain_text(value)
 
     # 历史消息存储路径
     base_storage_path = None
@@ -115,7 +118,9 @@ class ContextManager:
         """
         try:
             msg_dict = {
-                "message_str": msg.message_str if hasattr(msg, "message_str") else "",
+                "message_str": ContextManager._content_to_safe_text(
+                    msg.message_str if hasattr(msg, "message_str") else ""
+                ),
                 "platform_name": msg.platform_name
                 if hasattr(msg, "platform_name")
                 else "",
@@ -149,6 +154,114 @@ class ContextManager:
             return {"message_str": "", "timestamp": 0}
 
     @staticmethod
+    def _content_block_to_text(block: Any) -> tuple[str, bool]:
+        """提取单个 content block 的文本，并标记是否为非文本块。"""
+        if block is None:
+            return "", False
+
+        if isinstance(block, str):
+            return block, False
+
+        if isinstance(block, (int, float, bool)):
+            return str(block), False
+
+        if not isinstance(block, dict):
+            return str(block), False
+
+        if "role" in block and "content" in block:
+            return ContextManager._content_to_safe_text(block.get("content")), False
+
+        block_type = str(block.get("type", "") or "").lower()
+
+        text_value = block.get("text")
+        if text_value is not None:
+            return str(text_value), False
+
+        data = block.get("data")
+        if isinstance(data, dict) and data.get("text") is not None:
+            return str(data.get("text") or ""), False
+
+        nested_content = block.get("content")
+        if isinstance(nested_content, (str, list, dict)):
+            nested_text = ContextManager._content_to_safe_text(nested_content)
+            if nested_text:
+                return nested_text, False
+
+        if block_type in {
+            "image",
+            "image_url",
+            "input_image",
+            "audio",
+            "input_audio",
+            "file",
+            "video",
+        }:
+            return "", True
+
+        if block_type:
+            return "", True
+
+        return str(block), False
+
+    @staticmethod
+    def _content_to_safe_text(content: Any) -> str:
+        """将任意 content 兼容转换为安全字符串。"""
+        if content is None:
+            return ""
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, (int, float, bool)):
+            return str(content)
+
+        if isinstance(content, dict):
+            if "role" in content and "content" in content:
+                return ContextManager._content_to_safe_text(content.get("content"))
+            text, has_non_text = ContextManager._content_block_to_text(content)
+            if text:
+                return text
+            return "[多模态消息]" if has_non_text else str(content)
+
+        if isinstance(content, list):
+            text_parts = []
+            has_non_text = False
+            only_image_blocks = bool(content)
+
+            for item in content:
+                text, item_has_non_text = ContextManager._content_block_to_text(item)
+                if text:
+                    text_parts.append(text)
+                    only_image_blocks = False
+                if item_has_non_text:
+                    has_non_text = True
+                    if not (
+                        isinstance(item, dict)
+                        and "image" in str(item.get("type", "") or "").lower()
+                    ):
+                        only_image_blocks = False
+                elif not isinstance(item, dict):
+                    only_image_blocks = False
+
+            if text_parts:
+                return "".join(text_parts)
+            if has_non_text:
+                return "[图片]" if only_image_blocks else "[多模态消息]"
+            return ""
+
+        return str(content)
+
+    @staticmethod
+    def _make_content_hashable(content: Any) -> Any:
+        """将 content 转换为可哈希值，兼容多模态 list/dict。"""
+        if isinstance(content, (list, dict)):
+            try:
+                return json.dumps(content, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError):
+                return ContextManager._content_to_safe_text(content)
+        return content
+
+    @staticmethod
     def _dict_to_message(msg_dict: Dict[str, Any]) -> AstrBotMessage:
         """
         将字典转换回 AstrBotMessage 对象
@@ -161,7 +274,9 @@ class ContextManager:
         """
         try:
             msg = AstrBotMessage()
-            msg.message_str = msg_dict.get("message_str", "")
+            msg.message_str = ContextManager._content_to_safe_text(
+                msg_dict.get("message_str", "")
+            )
             msg.platform_name = msg_dict.get("platform_name", "")
             msg.timestamp = msg_dict.get("timestamp", 0)
 
@@ -202,7 +317,9 @@ class ContextManager:
             logger.error(f"从字典转换为消息对象失败: {e}")
             # 返回一个空的消息对象而不是 None，避免后续处理出错
             empty_msg = AstrBotMessage()
-            empty_msg.message_str = str(msg_dict.get("message_str", ""))
+            empty_msg.message_str = ContextManager._content_to_safe_text(
+                msg_dict.get("message_str", "")
+            )
             empty_msg.timestamp = 0
             return empty_msg
 
@@ -722,22 +839,8 @@ class ContextManager:
             msg = AstrBotMessage()
 
             # 从 content 字段提取消息文本
-            # content 是一个消息链列表，格式如 [{"type": "text", "data": {"text": "..."}}]
             content = history_item.content
-            message_text = ""
-            if isinstance(content, list):
-                for comp in content:
-                    if isinstance(comp, dict):
-                        comp_type = comp.get("type", "")
-                        comp_data = comp.get("data", {})
-                        if comp_type == "text" and isinstance(comp_data, dict):
-                            message_text += comp_data.get("text", "")
-            elif isinstance(content, dict):
-                # 兼容单个组件的情况
-                comp_type = content.get("type", "")
-                comp_data = content.get("data", {})
-                if comp_type == "text" and isinstance(comp_data, dict):
-                    message_text = comp_data.get("text", "")
+            message_text = ContextManager._content_to_safe_text(content)
 
             msg.message_str = message_text
             msg.platform_name = platform_name
@@ -847,7 +950,7 @@ class ContextManager:
             if context and hasattr(context, "message_history_manager"):
                 try:
                     if DEBUG_MODE:
-                        logger.info(f"[上下文管理器] 尝试从官方存储读取历史消息...")
+                        logger.info("[上下文管理器] 尝试从官方存储读取历史消息...")
 
                     official_history = await context.message_history_manager.get(
                         platform_id=platform_id,
@@ -1075,7 +1178,7 @@ class ContextManager:
             if context and hasattr(context, "message_history_manager") and platform_id:
                 try:
                     if DEBUG_MODE:
-                        logger.info(f"[上下文管理器] 尝试从官方存储读取历史消息...")
+                        logger.info("[上下文管理器] 尝试从官方存储读取历史消息...")
 
                     official_history = await context.message_history_manager.get(
                         platform_id=platform_id,
@@ -1317,18 +1420,22 @@ class ContextManager:
                                 ]
                                 weekday = weekday_names[dt.weekday()]
                                 time_str = dt.strftime(f"%Y-%m-%d {weekday} %H:%M:%S")
-                            except:
+                            except Exception:
                                 pass
 
                     # 获取消息内容
                     message_content = ""
                     if hasattr(msg, "message_str"):
-                        message_content = msg.message_str
+                        message_content = ContextManager._content_to_safe_text(
+                            msg.message_str
+                        )
                     elif hasattr(msg, "message"):
                         # 简单提取文本
                         for comp in msg.message:
                             if isinstance(comp, Plain):
-                                message_content += comp.text
+                                message_content += ContextManager._coerce_plain_text(
+                                    comp.text
+                                )
 
                     # 格式化消息（根据配置决定格式）
                     # 构建消息前缀部分
@@ -1380,7 +1487,8 @@ class ContextManager:
                 "=== 【重要】当前新消息（请优先关注这条消息的核心内容）==="
             )
             formatted_parts.append("=" * 50)
-            formatted_parts.append(current_message)
+            safe_current_message = ContextManager._content_to_safe_text(current_message)
+            formatted_parts.append(safe_current_message)
             formatted_parts.append("=" * 50)
 
             result = "\n".join(formatted_parts)
@@ -1391,7 +1499,7 @@ class ContextManager:
         except Exception as e:
             logger.error(f"格式化上下文时发生错误: {e}")
             # 发生错误时,至少返回当前消息
-            return current_message
+            return ContextManager._content_to_safe_text(current_message)
 
     @staticmethod
     def calculate_context_size(
@@ -1426,7 +1534,7 @@ class ContextManager:
         """
         try:
             # 导入 MessageCleaner
-            from .message_cleaner import MessageCleaner
+            from .private_chat_message_cleaner import MessageCleaner
 
             # 🔧 修复：更强的清理，确保所有系统提示词被移除
             cleaned_message = MessageCleaner.clean_message(message_text)
@@ -1545,11 +1653,23 @@ class ContextManager:
                     }
 
                     # 追加消息到文件（不加载全部历史到内存）
-                    ContextManager._append_message_to_file(file_path, user_msg_dict)
+                    # 使用线程池执行同步文件I/O，避免阻塞事件循环
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        ContextManager._append_message_to_file,
+                        file_path,
+                        user_msg_dict,
+                    )
 
                     # 检查并裁剪（逐行统计+逐行裁剪，不加载全部到内存）
                     effective_limit = ContextManager._get_effective_storage_limit()
-                    ContextManager._trim_messages_in_file(file_path, effective_limit)
+                    await loop.run_in_executor(
+                        None,
+                        ContextManager._trim_messages_in_file,
+                        file_path,
+                        effective_limit,
+                    )
 
                     if DEBUG_MODE:
                         logger.info("用户消息已保存到自定义历史记录")
@@ -1660,7 +1780,7 @@ class ContextManager:
         """
         try:
             # 导入 MessageCleaner
-            from .message_cleaner import MessageCleaner
+            from .private_chat_message_cleaner import MessageCleaner
 
             # 🔧 修复：更强的清理，确保所有系统提示词被移除
             cleaned_message = MessageCleaner.clean_message(bot_message_text)
@@ -1789,11 +1909,23 @@ class ContextManager:
                     }
 
                     # 追加消息到文件（不加载全部历史到内存）
-                    ContextManager._append_message_to_file(file_path, bot_msg_dict)
+                    # 使用线程池执行同步文件I/O，避免阻塞事件循环
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        ContextManager._append_message_to_file,
+                        file_path,
+                        bot_msg_dict,
+                    )
 
                     # 检查并裁剪（逐行统计+逐行裁剪，不加载全部到内存）
                     effective_limit = ContextManager._get_effective_storage_limit()
-                    ContextManager._trim_messages_in_file(file_path, effective_limit)
+                    await loop.run_in_executor(
+                        None,
+                        ContextManager._trim_messages_in_file,
+                        file_path,
+                        effective_limit,
+                    )
 
                     if DEBUG_MODE:
                         logger.info("AI回复消息已保存到自定义历史记录")
@@ -1915,7 +2047,7 @@ class ContextManager:
         """
         try:
             # 导入 MessageCleaner
-            from .message_cleaner import MessageCleaner
+            from .private_chat_message_cleaner import MessageCleaner
 
             # 🔧 修复：更强的清理，确保所有系统提示词被移除
             cleaned_message = MessageCleaner.clean_message(bot_message_text)
@@ -1973,11 +2105,23 @@ class ContextManager:
                     }
 
                     # 追加消息到文件（不加载全部历史到内存）
-                    ContextManager._append_message_to_file(file_path, bot_msg_dict)
+                    # 使用线程池执行同步文件I/O，避免阻塞事件循环
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        ContextManager._append_message_to_file,
+                        file_path,
+                        bot_msg_dict,
+                    )
 
                     # 检查并裁剪（逐行统计+逐行裁剪，不加载全部到内存）
                     effective_limit = ContextManager._get_effective_storage_limit()
-                    ContextManager._trim_messages_in_file(file_path, effective_limit)
+                    await loop.run_in_executor(
+                        None,
+                        ContextManager._trim_messages_in_file,
+                        file_path,
+                        effective_limit,
+                    )
 
                     if DEBUG_MODE:
                         logger.info("[主动对话保存] AI回复消息已保存到自定义历史记录")
@@ -2082,7 +2226,7 @@ class ContextManager:
                     logger.info(f"[官方保存] 创建新对话ID: {curr_cid}")
 
             if not curr_cid:
-                logger.warning(f"[官方保存] 无法创建或获取对话ID")
+                logger.warning("[官方保存] 无法创建或获取对话ID")
                 return False
 
             # 4. 获取当前对话的历史记录
@@ -2119,7 +2263,7 @@ class ContextManager:
                 )
                 return True
             else:
-                logger.error(f"[官方保存] 所有保存方法均失败")
+                logger.error("[官方保存] 所有保存方法均失败")
                 return False
 
         except Exception as e:
@@ -2204,7 +2348,7 @@ class ContextManager:
                                     )
                             else:
                                 logger.warning(
-                                    f"[官方保存] 验证失败：无法获取刚保存的对话"
+                                    "[官方保存] 验证失败：无法获取刚保存的对话"
                                 )
                         except Exception as ve:
                             logger.warning(f"[官方保存] 验证检查失败: {ve}")
@@ -2233,9 +2377,7 @@ class ContextManager:
                     except Exception as e2:
                         logger.warning(f"[官方保存] {m}（字符串）失败: {e2}")
 
-            logger.error(
-                f"❌ [官方保存] 所有保存方法均失败！消息可能未保存到官方系统！"
-            )
+            logger.error("❌ [官方保存] 所有保存方法均失败！消息可能未保存到官方系统！")
             return False
 
         except Exception as e:
@@ -2249,6 +2391,7 @@ class ContextManager:
         user_message: str,
         bot_message: str,
         context: "Context",
+        save_kind: str = "normal",
     ) -> bool:
         """
         保存到官方对话系统，支持缓存转正
@@ -2267,7 +2410,7 @@ class ContextManager:
         """
         try:
             # 导入 MessageCleaner
-            from .message_cleaner import MessageCleaner
+            from .private_chat_message_cleaner import MessageCleaner
 
             # 清理消息，确保不包含系统提示词
             user_message = MessageCleaner.clean_message(user_message) or user_message
@@ -2280,29 +2423,31 @@ class ContextManager:
                 for msg in cached_messages:
                     if isinstance(msg, dict) and "content" in msg:
                         original_content = msg["content"]
-                        cleaned_content = MessageCleaner.clean_message(original_content)
+                        cleaned_content = original_content
+                        if isinstance(original_content, str):
+                            cleaned_content = (
+                                MessageCleaner.clean_message(original_content)
+                                or original_content
+                            )
                         if cleaned_content:
                             msg["content"] = cleaned_content
 
             # 1. 获取unified_msg_origin（会话标识）
             unified_msg_origin = event.unified_msg_origin
             if DEBUG_MODE:
-                logger.info(f"========== [官方保存+缓存转正] 开始保存 ==========")
-                logger.info(
-                    f"[官方保存+缓存转正] unified_msg_origin: {unified_msg_origin}"
+                log_prefix = (
+                    "[官方保存+戳一戳事件]"
+                    if save_kind == "poke_event"
+                    else "[官方保存+缓存转正]"
                 )
-                logger.info(f"[官方保存+缓存转正] 缓存消息: {len(cached_messages)} 条")
-                logger.info(
-                    f"[官方保存+缓存转正] 用户消息长度: {len(user_message)} 字符"
-                )
+                logger.info(f"========== {log_prefix} 开始保存 ==========")
+                logger.info(f"{log_prefix} unified_msg_origin: {unified_msg_origin}")
+                logger.info(f"{log_prefix} 缓存消息: {len(cached_messages)} 条")
+                logger.info(f"{log_prefix} 用户消息长度: {len(user_message)} 字符")
                 if bot_message is not None:
-                    logger.info(
-                        f"[官方保存+缓存转正] AI回复长度: {len(bot_message)} 字符"
-                    )
+                    logger.info(f"{log_prefix} AI回复长度: {len(bot_message)} 字符")
                 else:
-                    logger.info(
-                        "[官方保存+缓存转正] 本次不保存AI回复（bot_message为空）"
-                    )
+                    logger.info(f"{log_prefix} 本次不保存AI回复（bot_message为空）")
 
             # 2. 获取conversation_manager
             cm = context.conversation_manager
@@ -2358,12 +2503,12 @@ class ContextManager:
                     return False
 
             if not curr_cid:
-                logger.error(f"❌ [官方保存+缓存转正] 无法创建或获取对话ID")
+                logger.error("❌ [官方保存+缓存转正] 无法创建或获取对话ID")
                 return False
 
             # 4. 获取当前对话的历史记录
             if DEBUG_MODE:
-                logger.info(f"[官方保存+缓存转正] 正在获取对话历史...")
+                logger.info("[官方保存+缓存转正] 正在获取对话历史...")
             try:
                 conversation = await cm.get_conversation(
                     unified_msg_origin=unified_msg_origin, conversation_id=curr_cid
@@ -2400,14 +2545,14 @@ class ContextManager:
                     history_list = []
             else:
                 if DEBUG_MODE:
-                    logger.info(f"[官方保存+缓存转正] 对话历史为空，从头开始")
+                    logger.info("[官方保存+缓存转正] 对话历史为空，从头开始")
                 history_list = []
 
             # 6. 添加需要转正的缓存消息（去重）
             cache_converted = 0
             if cached_messages:
                 if DEBUG_MODE:
-                    logger.info(f"[官方保存+缓存转正] 开始处理缓存消息转正...")
+                    logger.info("[官方保存+缓存转正] 开始处理缓存消息转正...")
 
                 # 提取现有历史中的消息内容（用于去重）
                 # 辅助函数：将content转换为可哈希格式
@@ -2519,12 +2664,19 @@ class ContextManager:
                     )
             else:
                 if DEBUG_MODE:
-                    logger.info(f"[官方保存+缓存转正] 无缓存消息需要转正")
+                    logger.info("[官方保存+缓存转正] 无缓存消息需要转正")
 
             # 7. 添加当前用户消息
-            history_list.append({"role": "user", "content": user_message})
-            if DEBUG_MODE:
-                logger.info(f"[官方保存+缓存转正] 添加用户消息: {user_message[:50]}...")
+            if user_message:
+                history_list.append({"role": "user", "content": user_message})
+                if DEBUG_MODE:
+                    logger.info(
+                        f"[官方保存+缓存转正] 添加用户消息: {user_message[:50]}..."
+                    )
+            elif DEBUG_MODE:
+                logger.info(
+                    "[官方保存+缓存转正] user_message为空，本次不添加用户消息到历史"
+                )
 
             # 8. 添加AI回复（可选）
             if bot_message:
@@ -2560,7 +2712,7 @@ class ContextManager:
 
             if DEBUG_MODE:
                 logger.info(
-                    f"[官方保存+缓存转正] ========== 调用底层保存方法 =========="
+                    "[官方保存+缓存转正] ========== 调用底层保存方法 =========="
                 )
 
             # 9. 使用官方API保存
@@ -2578,17 +2730,29 @@ class ContextManager:
                     ]
                 )
 
-                logger.info(f"=" * 60)
-                logger.info(f"✅✅✅ [官方保存+缓存转正] 保存成功！")
-                logger.info(f"  对话ID: {curr_cid}")
-                logger.info(f"  总消息数: {len(history_list)}")
-                logger.info(f"  缓存转正: {cache_converted} 条")
-                added_ai = 1 if bot_message else 0
-                logger.info(f"  新增消息: 用户1条 + AI{added_ai}条")
-                logger.info(f"=" * 60)
+                if save_kind == "poke_event":
+                    logger.info("=" * 60)
+                    logger.info("✅ [官方保存+戳一戳事件] 额外保存成功！")
+                    logger.info(f"  对话ID: {curr_cid}")
+                    logger.info(f"  总消息数: {len(history_list)}")
+                    logger.info(
+                        f"  事件类型: AI戳一戳事件（额外保存，未转正缓存{cache_converted}条）"
+                    )
+                    logger.info("  新增消息: 用户0条 + AI1条")
+                    logger.info("=" * 60)
+                else:
+                    logger.info("=" * 60)
+                    logger.info("✅✅✅ [官方保存+缓存转正] 保存成功！")
+                    logger.info(f"  对话ID: {curr_cid}")
+                    logger.info(f"  总消息数: {len(history_list)}")
+                    logger.info(f"  缓存转正: {cache_converted} 条")
+                    added_ai = 1 if bot_message else 0
+                    added_user = 1 if user_message else 0
+                    logger.info(f"  新增消息: 用户{added_user}条 + AI{added_ai}条")
+                    logger.info("=" * 60)
                 return True
             else:
-                logger.error(f"❌❌❌ [官方保存+缓存转正] 保存失败！所有方法均失败！")
+                logger.error("❌❌❌ [官方保存+缓存转正] 保存失败！所有方法均失败！")
                 return False
 
         except Exception as e:

@@ -7,13 +7,13 @@ v1.0.4 更新：
 - 在开启include_sender_info时，在消息末尾添加系统提示帮助AI识别发送者
 
 作者: Him666233
-版本: v1.2.1
+版本: v1.2.2
 """
 
 import re
 from datetime import datetime
 from astrbot.api.all import *
-from astrbot.api.message_components import At, Plain
+from astrbot.api.message_components import At
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
@@ -55,8 +55,8 @@ class MessageProcessor:
             mention_info: @别人的信息字典（如果存在）
             trigger_type: 触发方式，可选值: "at", "keyword", "ai_decision"
             poke_info: 戳一戳信息字典（v1.0.9新增，如果存在）
-            is_empty_at: 是否是空@消息（只有@没有其他内容）
-            recent_pending_summary: 最近缓存消息摘要文本（空@时直接嵌入提示词，避免AI在长历史中找不到）
+            is_empty_at: 是否是单独无信息@消息（只有@没有其他内容）
+            recent_pending_summary: 最近缓存消息摘要文本（仅用于这类单独无信息@消息时的上下文参考）
 
         Returns:
             添加元数据后的文本
@@ -98,7 +98,7 @@ class MessageProcessor:
                     # 构建系统提示（使用特殊标记【】，确保不会被MessageCleaner过滤）
                     # 注意：措辞要对决策AI和回复AI都适用，不要加"请判断是否回复"这种话
                     mention_notice = (
-                        f"\n【@指向说明】这条消息通过@符号指定发送给其他用户"
+                        "\n【@指向说明】这条消息通过@符号指定发送给其他用户"
                     )
                     if mentioned_name:
                         mention_notice += (
@@ -168,7 +168,7 @@ class MessageProcessor:
                 # 根据触发方式添加不同的系统提示
                 if trigger_type == "at":
                     # @消息触发
-                    # 🔧 修复：区分空@消息和带消息的@消息，给AI不同的提示
+                    # 区分单独无信息@消息和带消息的@消息，给AI不同的提示
                     if is_empty_at:
                         # 纯@消息（没有文字内容）
                         if recent_pending_summary:
@@ -199,12 +199,12 @@ class MessageProcessor:
                             f"@你的那个人是{sender_info_text}"
                         )
                 elif trigger_type == "keyword":
-                    # 关键词触发：提示AI仔细观察上下文，自然判断如何回复
+                    # 关键词触发：强调消息与AI相关，但保持回复导向而不是判断导向
                     system_notice = (
-                        f"\n\n[系统提示]注意，你刚刚发现这条消息里面包含和你有关的信息，"
+                        f"\n\n[系统提示]注意，这条消息中出现了和你有关的信息，"
                         f"这条消息的发送者是{sender_info_text}。\n"
-                        f"🔍 请仔细观察上下文和对话走向，结合发送者的实际意图，"
-                        f"像真人一样自然地决定怎么回复——不要只因为关键词就机械回应。"
+                        f"请先结合最近上下文理解对方现在在聊什么、这句话主要是对谁说的，"
+                        f"然后像正常聊天一样自然回应。"
                     )
                 elif trigger_type == "ai_decision":
                     # AI主动回复（中性描述，不预设结果）
@@ -254,7 +254,7 @@ class MessageProcessor:
             mention_info: @别人的信息字典（如果存在）
             trigger_type: 触发方式，可选值: "at", "keyword", "ai_decision"
             poke_info: 戳一戳信息字典（v1.0.9新增，如果存在）
-            is_empty_at: 是否是空@消息（只有@没有其他内容）
+            is_empty_at: 是否是单独无信息@消息（只有@没有其他内容）
 
         Returns:
             添加元数据后的文本
@@ -276,7 +276,7 @@ class MessageProcessor:
                     ]
                     weekday = weekday_names[dt.weekday()]
                     timestamp_str = dt.strftime(f"%Y-%m-%d {weekday} %H:%M:%S")
-                except:
+                except Exception:
                     # 如果时间戳转换失败，使用当前时间
                     dt = datetime.now()
                     weekday_names = [
@@ -319,7 +319,7 @@ class MessageProcessor:
                     # 构建系统提示（使用特殊标记【】，确保不会被MessageCleaner过滤）
                     # 注意：措辞要对决策AI和回复AI都适用，不要加"请判断是否回复"这种话
                     mention_notice = (
-                        f"\n【@指向说明】这条消息通过@符号指定发送给其他用户"
+                        "\n【@指向说明】这条消息通过@符号指定发送给其他用户"
                     )
                     if mentioned_name:
                         mention_notice += (
@@ -384,7 +384,7 @@ class MessageProcessor:
                 # 根据触发方式添加不同的系统提示
                 if trigger_type == "at":
                     # @消息触发
-                    # 🔧 修复：区分空@消息和带消息的@消息，给AI不同的提示
+                    # 区分单独无信息@消息和带消息的@消息，给AI不同的提示
                     if is_empty_at:
                         # 纯@消息（没有文字内容）
                         # 🔧 修复：使用更强烈明确的提示词，引导AI关注历史最后几条消息

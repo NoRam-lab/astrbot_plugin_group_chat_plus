@@ -3,7 +3,7 @@
 负责统一管理待决策消息的缓存、读取、合并和转正保存
 
 作者: Him666233
-版本: v1.2.1
+版本: v1.2.2
 """
 
 import time
@@ -15,6 +15,23 @@ from astrbot.api import logger
 from .message_processor import MessageProcessor
 from .message_cleaner import MessageCleaner
 from .proactive_chat_manager import ProactiveChatManager
+from .context_manager import ContextManager
+
+
+def _append_persistent_poke_event_text(base_text: str, event_text: str) -> str:
+    try:
+        base_text = base_text or ""
+        event_text = (event_text or "").strip()
+        if not event_text:
+            return base_text
+        if event_text in base_text:
+            return base_text
+        if not base_text.strip():
+            return event_text
+        return f"{base_text}\n{event_text}"
+    except Exception as e:
+        logger.warning(f"[消息缓存] 追加戳一戳持久事件文本失败，已回退原文本: {e}")
+        return base_text
 
 
 class MessageCacheManager:
@@ -167,11 +184,10 @@ class MessageCacheManager:
         logger.info(f"📦 [缓存-{source}] 已缓存消息 (共{cache_count}条)")
 
         if self.debug_mode:
-            content_preview = (
-                message_data.get("content", "")[:100]
-                if message_data.get("content")
-                else "(空)"
+            content_preview = ContextManager._content_to_safe_text(
+                message_data.get("content", "")
             )
+            content_preview = content_preview[:100] if content_preview else "(空)"
             logger.info(f"  [缓存管理器] 缓存内容: {content_preview}...")
 
         return cache_count
@@ -202,6 +218,11 @@ class MessageCacheManager:
         elif exclude_current:
             # 只有1条消息，排除后为空
             return []
+
+        # 过滤掉窗口缓冲消息（与 get_regular_cached_messages 保持一致）
+        cached_messages = [
+            msg for msg in cached_messages if not msg.get("window_buffered", False)
+        ]
 
         # 过滤过期消息
         filtered_messages = ProactiveChatManager.filter_expired_cached_messages(
@@ -316,7 +337,16 @@ class MessageCacheManager:
             if isinstance(cached_msg, dict):
                 try:
                     msg_obj = AstrBotMessage()
-                    msg_obj.message_str = cached_msg.get("content", "")
+                    msg_obj.message_str = (
+                        MessageProcessor.format_message_for_context_display(
+                            ContextManager._content_to_safe_text(
+                                cached_msg.get("content", "")
+                            ),
+                            cached_msg.get("mention_info"),
+                            cached_msg.get("is_at_all_message", False),
+                            cached_msg.get("persistent_poke_event_text", ""),
+                        )
+                    )
                     msg_obj.platform_name = event.get_platform_name()
                     msg_obj.timestamp = cached_msg.get(
                         "message_timestamp"
@@ -400,7 +430,7 @@ class MessageCacheManager:
         # 如果主动对话正在处理，跳过缓存转正
         if proactive_processing:
             if self.debug_mode:
-                logger.info(f"  [缓存管理器] 主动对话正在处理，跳过缓存转正")
+                logger.info("  [缓存管理器] 主动对话正在处理，跳过缓存转正")
             return []
 
         # 过滤要转正的消息（Phase-1：仅处理普通缓存，跳过窗口缓冲消息）
@@ -456,7 +486,9 @@ class MessageCacheManager:
         for cached_msg in raw_cached:
             if isinstance(cached_msg, dict) and "content" in cached_msg:
                 # 获取处理后的消息内容（不含元数据）
-                raw_content = cached_msg["content"]
+                raw_content = ContextManager._content_to_safe_text(
+                    cached_msg["content"]
+                )
 
                 # 确定触发方式
                 trigger_type = None
@@ -478,10 +510,17 @@ class MessageCacheManager:
                     cached_msg.get("mention_info"),
                     trigger_type,
                     cached_msg.get("poke_info"),
+                    cached_msg.get("is_empty_at", False),
+                    "",
+                    cached_msg.get("is_at_all_message", False),
                 )
 
                 # 清理系统提示
                 msg_content = MessageCleaner.clean_message(msg_content)
+                msg_content = _append_persistent_poke_event_text(
+                    msg_content,
+                    cached_msg.get("persistent_poke_event_text", ""),
+                )
 
                 # 保存图片URL
                 cached_image_urls = cached_msg.get("image_urls", [])
@@ -490,6 +529,13 @@ class MessageCacheManager:
                 convert_entry = {
                     "role": cached_msg.get("role", "user"),
                     "content": msg_content,
+                    "sender_id": cached_msg.get("sender_id", "") or "unknown",
+                    "sender_name": cached_msg.get("sender_name", "") or "未知用户",
+                    "message_timestamp": (
+                        cached_msg.get("message_timestamp")
+                        or cached_msg.get("timestamp", 0)
+                    ),
+                    "message_id": cached_msg.get("message_id", ""),
                 }
 
                 if cached_image_urls:
@@ -535,7 +581,7 @@ class MessageCacheManager:
         # 如果主动对话正在处理，跳过缓存清理
         if proactive_processing:
             logger.info(
-                f"  [缓存管理器] 主动对话正在处理，跳过缓存清理（由主动对话负责）"
+                "  [缓存管理器] 主动对话正在处理，跳过缓存清理（由主动对话负责）"
             )
             return 0, len(self.pending_messages_cache[chat_id])
 
@@ -655,6 +701,59 @@ class MessageCacheManager:
 
         return window_msgs
 
+    def convert_window_buffered_to_regular(
+        self,
+        chat_id: str,
+        sender_id: str,
+        token: int = 0,
+    ) -> int:
+        """
+        将指定会话中指定用户的窗口缓冲消息转换为普通缓存消息
+
+        当决策AI判定不回复时调用此方法，将该用户在当前窗口批次中的
+        窗口缓冲消息（window_buffered=True）转为普通缓存。
+
+        通过 gww_token 精确绑定窗口批次：
+        - token > 0 时：仅转换 gww_token 匹配的消息（精确绑定当前窗口）
+        - token = 0 时：转换该用户所有窗口缓冲消息（无窗口时的兜底）
+
+        只转换当前用户在当前会话中的窗口缓冲消息，不会影响其他用户
+        或其他会话的数据。
+
+        Args:
+            chat_id: 会话ID
+            sender_id: 发送者ID（仅转换该用户的消息）
+            token: 窗口令牌（0=无令牌匹配，>0=精确匹配 gww_token）
+
+        Returns:
+            转换的消息数量
+        """
+        if chat_id not in self.pending_messages_cache:
+            return 0
+
+        converted_count = 0
+        for msg in self.pending_messages_cache[chat_id]:
+            if not (
+                isinstance(msg, dict)
+                and msg.get("window_buffered", False)
+                and str(msg.get("sender_id", "")) == str(sender_id)
+            ):
+                continue
+            # 令牌过滤：有令牌时只转换匹配的批次，防止跨窗口污染
+            if token > 0 and msg.get("gww_token") != token:
+                continue
+            msg.pop("window_buffered", None)
+            converted_count += 1
+
+        if converted_count > 0:
+            _token_info = f"（令牌={token}）" if token > 0 else "（无令牌，全部转换）"
+            logger.info(
+                f"  [缓存管理器] 已将用户 {sender_id} 的 {converted_count} 条"
+                f" 窗口缓冲消息转换为普通缓存{_token_info}，避免上下文顺序错乱"
+            )
+
+        return converted_count
+
     def prepare_window_buffered_for_save(
         self,
         chat_id: str,
@@ -691,7 +790,7 @@ class MessageCacheManager:
             if msg_id and msg_id in processing_msg_ids:
                 continue
 
-            raw_content = cached_msg["content"]
+            raw_content = ContextManager._content_to_safe_text(cached_msg["content"])
 
             # 确定触发方式
             trigger_type = None
@@ -713,10 +812,17 @@ class MessageCacheManager:
                 cached_msg.get("mention_info"),
                 trigger_type,
                 cached_msg.get("poke_info"),
+                cached_msg.get("is_empty_at", False),
+                "",
+                cached_msg.get("is_at_all_message", False),
             )
 
             # 清理系统提示
             msg_content = MessageCleaner.clean_message(msg_content)
+            msg_content = _append_persistent_poke_event_text(
+                msg_content,
+                cached_msg.get("persistent_poke_event_text", ""),
+            )
 
             # 保存图片URL
             cached_image_urls = cached_msg.get("image_urls", [])
@@ -724,12 +830,29 @@ class MessageCacheManager:
             convert_entry = {
                 "role": cached_msg.get("role", "user"),
                 "content": msg_content,
+                "sender_id": cached_msg.get("sender_id", "") or "unknown",
+                "sender_name": cached_msg.get("sender_name", "") or "未知用户",
+                "message_timestamp": cached_msg.get("message_timestamp")
+                or cached_msg.get("timestamp", 0),
+                "message_id": cached_msg.get("message_id", ""),
             }
 
             if cached_image_urls:
                 convert_entry["image_urls"] = cached_image_urls
 
             cached_messages_to_convert.append(convert_entry)
+
+            if cached_msg.get("smart_merged"):
+                _smart_sender = f"{cached_msg.get('sender_name', '未知用户')}(ID:{cached_msg.get('sender_id', 'unknown')})"
+                _smart_msg_id = cached_msg.get("message_id", "")[:16]
+                smart_merged_reply = f"[Smart合并] {_smart_sender}的消息已与同期消息合并处理，AI已在合并回复中一并回应，无需重复回答（ref:{_smart_msg_id}）"
+                cached_messages_to_convert.append(
+                    {"role": "assistant", "content": smart_merged_reply}
+                )
+                if self.debug_mode:
+                    logger.info(
+                        "  [缓存管理器] Phase-2 Smart合并消息: 已添加虚拟AI回复标记"
+                    )
 
             if self.debug_mode:
                 sender_info = f"{cached_msg.get('sender_name')}(ID: {cached_msg.get('sender_id')})"

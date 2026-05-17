@@ -9,14 +9,11 @@
 5. 图片处理（支持多模态直传和图片转文字，含省钱缓存）
 
 作者: Him666233
-版本: v1.2.1
+版本: v1.2.2
 """
 
-import time
 import asyncio
-import random
 from typing import Optional, List, Dict, Any
-from pathlib import Path
 
 from astrbot.api.all import *
 from astrbot.api import logger
@@ -174,7 +171,7 @@ class PrivateChatMain:
             event: AstrBot消息事件对象，包含完整的私信消息信息
         """
         if self.private_chat_debug_mode:
-            logger.info(f"[私信处理] 收到私信消息，开始处理")
+            logger.info("[私信处理] 收到私信消息，开始处理")
 
         # 用户名单过滤检查
         if self._should_filter_user(event):
@@ -574,6 +571,7 @@ class PrivateChatMain:
                             self.image_to_text_timeout,
                             image_cache_to_use,
                             len(limited_earlier),
+                            getattr(event, "session_id", ""),
                         )
                     )
                     if earlier_result:

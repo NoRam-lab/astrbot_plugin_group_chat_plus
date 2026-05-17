@@ -6,24 +6,29 @@
 const App = {
     _currentView: 'tech-tree',
     _initialized: false,
+    _authMonitor: null,
+    _configFileName: '',
+    _configPanelOpen: false,
 
     /** 应用入口（面板页面加载时调用） */
     async start() {
-        // 面板页已由服务端验证 token，这里做一次客户端 token 检查
-        if (!Api._token) {
-            window.location.href = '/';
-            return;
+        const configMeta = await Api.getConfig();
+        if (configMeta && configMeta.ok) {
+            this._configFileName = configMeta.config_file_name || '';
         }
 
-        // 验证 token 有效性
+        const heartbeatConfig = this._buildHeartbeatConfig(
+            configMeta && configMeta.ok ? (configMeta.config || {}) : {}
+        );
+        this._installAuthMonitor(heartbeatConfig);
+
         const verify = await Api.verify();
         if (!verify.ok) {
-            Api.clearToken();
-            window.location.href = '/';
+            this._redirectToLogin(verify.reason || 'expired', verify.msg || '登录已失效，请重新登录');
             return;
         }
 
-        // 进入主界面
+        this._authMonitor?.markAuthenticated?.(verify);
         this.showPage('main');
         await this._initMain();
     },
@@ -47,6 +52,8 @@ const App = {
         const nav = document.querySelector(`.nav-item[data-view="${name}"]`);
         if (nav) nav.classList.add('active');
 
+        this._updateConfigBadgeVisibility();
+
         // 按需初始化视图
         this._activateView(name);
     },
@@ -57,6 +64,7 @@ const App = {
         if (name !== 'charts') Charts.destroy();
         if (name !== 'sessions') SessionMgr.destroy();
         if (name !== 'tech-tree' && typeof TechTree !== 'undefined') TechTree.closeAllFloaters();
+        if (name !== 'tech-tree') this.setConfigPanelOpen(false);
 
         switch (name) {
             case 'tech-tree':
@@ -96,13 +104,27 @@ const App = {
             });
         });
 
+        this._ensureConfigBadge();
+        this._updateConfigBadgeVisibility();
+
         // 退出登录
         const btnLogout = document.getElementById('btn-logout');
         if (btnLogout) {
             btnLogout.addEventListener('click', async () => {
                 await Api.logout();
-                Api.clearToken();
-                window.location.href = '/';
+                this._authMonitor?.broadcast?.('logout');
+                this._redirectToLogin('logout', '您已退出登录', { showAlert: false });
+            });
+        }
+
+        // 支持作者
+        const btnSupportAuthor = document.getElementById('btn-support-author');
+        if (btnSupportAuthor) {
+            btnSupportAuthor.addEventListener('click', async () => {
+                const ok = await Utils.supportAuthorDialog();
+                if (ok) {
+                    window.open('https://afdian.com/a/chat_plus', '_blank');
+                }
             });
         }
 
@@ -157,7 +179,7 @@ const App = {
             {
                 id: 'reset',
                 name: '全局重置 (gcp_reset)',
-                desc: '重置所有插件数据（注意力、情绪、概率等运行时状态）。不影响聊天记录和配置文件。',
+                desc: '重置所有插件数据（注意力、情绪、概率等运行时状态）并清除所有会话的聊天记录缓存。不影响配置文件。',
                 icon: '🔄',
                 color: 'orange',
                 exec: async (mode) => {
@@ -267,6 +289,9 @@ const App = {
 
     /** 渲染访问日志视图 */
     async _renderAccessLog() {
+        // 每次进入视图都重置到第一页，确保最新日志可见
+        this._accessLogPage = 1;
+
         const container = document.getElementById('access-log-container');
         if (!container) return;
         container.innerHTML = '';
@@ -304,7 +329,6 @@ const App = {
         await Promise.all([this._loadBanList(), this._loadAccessLog()]);
     },
 
-    /** 加载封禁列表 */
     async _loadBanList() {
         const container = document.getElementById('ban-list-container');
         if (!container) return;
@@ -319,35 +343,66 @@ const App = {
             return;
         }
         container.innerHTML = '';
-        const table = document.createElement('table');
-        table.className = 'log-table';
-        table.innerHTML = `<thead><tr>
-            <th>IP</th><th>来源</th><th>原因</th><th>封禁时间</th><th>剩余时间</th><th>操作</th>
-        </tr></thead>`;
-        const tbody = document.createElement('tbody');
-        bans.forEach(ban => {
-            const tr = document.createElement('tr');
-            const remaining = ban.remaining_seconds === null
-                ? '永久' : Utils.formatDuration(ban.remaining_seconds);
-            // 判断封禁来源（防爬虫自动 / 手动）
-            const isSpider = ban.reason && ban.reason.startsWith('[防爬虫]');
-            const sourceBadge = isSpider
-                ? '<span style="font-size:11px;background:rgba(224,32,32,0.15);color:var(--accent-red);border:1px solid rgba(224,32,32,0.35);border-radius:3px;padding:1px 5px;">🕷️ 自动</span>'
-                : '<span style="font-size:11px;background:var(--glass-bg-hover);color:var(--text-secondary);border:1px solid var(--glass-border);border-radius:3px;padding:1px 5px;">👤 手动</span>';
-            const displayReason = Utils.escapeHtml(ban.reason || '');
-            tr.innerHTML = `
-                <td style="font-family:monospace;">${Utils.escapeHtml(ban.ip)}</td>
-                <td>${sourceBadge}</td>
-                <td title="${displayReason}" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${displayReason}</td>
-                <td>${Utils.formatTime(ban.banned_at)}</td>
-                <td>${remaining}</td>
-                <td><button class="btn btn-sm" data-unban="${Utils.escapeHtml(ban.ip)}">解封</button></td>`;
-            tbody.appendChild(tr);
-        });
-        table.appendChild(tbody);
-        container.appendChild(table);
 
-        // 解封按钮事件
+        if (window.innerWidth <= 1023) {
+            const list = document.createElement('div');
+            list.className = 'log-card-list';
+            bans.forEach(ban => {
+                const remaining = ban.remaining_seconds === null
+                    ? '永久' : Utils.formatDuration(ban.remaining_seconds);
+                const isSpider = ban.reason && ban.reason.startsWith('[防爬虫]');
+                const sourceBadge = isSpider
+                    ? '<span class="status-badge status-warn">🕷️ 自动</span>'
+                    : '<span class="status-badge">👤 手动</span>';
+                const card = document.createElement('div');
+                card.className = 'log-card';
+                card.innerHTML = `
+                    <div class="log-card-header">
+                        <span class="log-card-ip">${Utils.escapeHtml(ban.ip)}</span>
+                        ${sourceBadge}
+                    </div>
+                    <div class="log-card-row"><strong>原因</strong><span>${Utils.escapeHtml(ban.reason || '')}</span></div>
+                    <div class="log-card-row"><strong>封禁时间</strong><span>${Utils.formatTime(ban.banned_at)}</span></div>
+                    <div class="log-card-row"><strong>剩余时间</strong><span>${remaining}</span></div>
+                    <div class="log-card-actions">
+                        <button class="btn btn-sm" data-edit-ban="${Utils.escapeHtml(ban.ip)}">编辑备注</button>
+                        <button class="btn btn-sm" data-unban="${Utils.escapeHtml(ban.ip)}">解封</button>
+                    </div>`;
+                list.appendChild(card);
+            });
+            container.appendChild(list);
+        } else {
+            const table = document.createElement('table');
+            table.className = 'log-table';
+            table.innerHTML = `<thead><tr>
+                <th>IP</th><th>来源</th><th>原因</th><th>封禁时间</th><th>剩余时间</th><th>操作</th>
+            </tr></thead>`;
+            const tbody = document.createElement('tbody');
+            bans.forEach(ban => {
+                const tr = document.createElement('tr');
+                const remaining = ban.remaining_seconds === null
+                    ? '永久' : Utils.formatDuration(ban.remaining_seconds);
+                const isSpider = ban.reason && ban.reason.startsWith('[防爬虫]');
+                const sourceBadge = isSpider
+                    ? '<span style="font-size:11px;background:rgba(224,32,32,0.15);color:var(--accent-red);border:1px solid rgba(224,32,32,0.35);border-radius:3px;padding:1px 5px;">🕷️ 自动</span>'
+                    : '<span style="font-size:11px;background:var(--glass-bg-hover);color:var(--text-secondary);border:1px solid var(--glass-border);border-radius:3px;padding:1px 5px;">👤 手动</span>';
+                const displayReason = Utils.escapeHtml(ban.reason || '');
+                tr.innerHTML = `
+                    <td style="font-family:monospace;">${Utils.escapeHtml(ban.ip)}</td>
+                    <td>${sourceBadge}</td>
+                    <td title="${displayReason}" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${displayReason}</td>
+                    <td>${Utils.formatTime(ban.banned_at)}</td>
+                    <td>${remaining}</td>
+                    <td>
+                        <button class="btn btn-sm" data-edit-ban="${Utils.escapeHtml(ban.ip)}">编辑备注</button>
+                        <button class="btn btn-sm" data-unban="${Utils.escapeHtml(ban.ip)}">解封</button>
+                    </td>`;
+                tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+            container.appendChild(table);
+        }
+
         container.querySelectorAll('[data-unban]').forEach(btn => {
             btn.addEventListener('click', async () => {
                 const ip = btn.dataset.unban;
@@ -359,6 +414,23 @@ const App = {
                     await this._loadBanList();
                 } else {
                     Utils.toast(res.msg || '解封失败', 'error');
+                }
+            });
+        });
+
+        container.querySelectorAll('[data-edit-ban]').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const ip = btn.dataset.editBan;
+                const ban = bans.find(b => b.ip === ip);
+                const currentReason = ban ? (ban.reason || '') : '';
+                const newReason = await Utils.prompt(`编辑 ${ip} 的封禁备注`, currentReason);
+                if (newReason === null) return;
+                const res = await Api.updateBanNote(ip, newReason);
+                if (res.ok) {
+                    Utils.toast('备注已更新', 'success');
+                    await this._loadBanList();
+                } else {
+                    Utils.toast(res.msg || '更新失败', 'error');
                 }
             });
         });
@@ -386,48 +458,93 @@ const App = {
         }
 
         container.innerHTML = '';
-        const table = document.createElement('table');
-        table.className = 'log-table';
-        table.innerHTML = `<thead><tr>
-            <th>时间</th><th>IP</th><th>方法</th><th>路径</th><th>状态</th><th>附注</th><th>操作</th>
-        </tr></thead>`;
-        const tbody = document.createElement('tbody');
-        logs.forEach(log => {
-            const tr = document.createElement('tr');
-            const statusClass = log.status >= 400 ? 'status-error' :
-                                log.status >= 300 ? 'status-warn' : 'status-ok';
 
-            // 附注渲染：防爬虫自动封禁事件使用橙色高亮标签
-            let noteHtml = '';
-            if (log.note) {
-                if (log.note.includes('[防爬虫自动封禁]')) {
-                    noteHtml = `<span class="log-note-spider" title="${Utils.escapeHtml(log.note)}"
-                        style="font-size:11px;background:rgba(224,32,32,0.15);color:var(--accent-red);
-                        border:1px solid rgba(224,32,32,0.35);border-radius:3px;padding:2px 6px;
-                        white-space:nowrap;display:inline-block;">
-                        🕷️ ${Utils.escapeHtml(log.note.slice(0, 40))}${log.note.length > 40 ? '…' : ''}
-                    </span>`;
-                } else {
-                    noteHtml = `<span class="log-note" title="${Utils.escapeHtml(log.note)}">${Utils.escapeHtml(log.note.slice(0, 30))}${log.note.length > 30 ? '…' : ''}</span>`;
+        if (window.innerWidth <= 1023) {
+            const list = document.createElement('div');
+            list.className = 'log-card-list';
+            logs.forEach((log, idx) => {
+                const statusClass = log.status >= 400 ? 'status-error' :
+                    (log.status >= 300 ? 'status-warn' : 'status-ok');
+                // 移动端完整显示附注（不截断），允许自动换行
+                let noteHtml = '<span class="log-card-note-empty">—</span>';
+                if (log.note) {
+                    const safeNote = Utils.escapeHtml(log.note);
+                    noteHtml = log.note.includes('[防爬虫自动封禁]')
+                        ? `<span class="status-badge status-warn log-card-note-full" title="${safeNote}">🕷️ ${safeNote}</span>`
+                        : log.note.includes('登录失败')
+                            ? `<span class="status-badge status-warn log-card-note-full" title="${safeNote}">🔑 ${safeNote}</span>`
+                            : `<span class="log-card-note-full" title="${safeNote}">${safeNote}</span>`;
                 }
-            }
+                const card = document.createElement('div');
+                card.className = 'log-card';
+                card.innerHTML = `
+                    <div class="log-card-header">
+                        <span class="log-card-ip">${Utils.escapeHtml(log.ip)}</span>
+                        <span class="status-badge ${statusClass}">${log.status}</span>
+                    </div>
+                    <div class="log-card-row"><strong>时间</strong><span>${Utils.formatTime(log.timestamp)}</span></div>
+                    <div class="log-card-row"><strong>方法</strong><span>${Utils.escapeHtml(log.method)}</span></div>
+                    <div class="log-card-row"><strong>路径</strong><span class="log-card-path">${Utils.escapeHtml(log.path)}</span></div>
+                    <div class="log-card-row"><strong>附注</strong>${noteHtml}</div>
+                    <div class="log-card-actions">
+                        <button class="btn btn-sm btn-danger" data-ban-ip="${Utils.escapeHtml(log.ip)}" data-log-idx="${idx}">封禁</button>
+                    </div>`;
+                list.appendChild(card);
+            });
+            container.appendChild(list);
+        } else {
+            const table = document.createElement('table');
+            table.className = 'log-table';
+            table.innerHTML = `<thead><tr>
+                <th>时间</th><th>IP</th><th>方法</th><th>路径</th><th>状态</th><th>附注</th><th>操作</th>
+            </tr></thead>`;
+            const tbody = document.createElement('tbody');
+            logs.forEach((log, idx) => {
+                const tr = document.createElement('tr');
+                const statusClass = log.status >= 400 ? 'status-error' :
+                                    log.status >= 300 ? 'status-warn' : 'status-ok';
 
-            tr.innerHTML = `
-                <td>${Utils.formatTime(log.timestamp)}</td>
-                <td style="font-family:monospace;">${Utils.escapeHtml(log.ip)}</td>
-                <td>${Utils.escapeHtml(log.method)}</td>
-                <td class="log-path">${Utils.escapeHtml(log.path)}</td>
-                <td><span class="status-badge ${statusClass}">${log.status}</span></td>
-                <td>${noteHtml}</td>
-                <td><button class="btn btn-sm btn-danger" data-ban-ip="${Utils.escapeHtml(log.ip)}">封禁</button></td>`;
-            tbody.appendChild(tr);
-        });
-        table.appendChild(tbody);
-        container.appendChild(table);
+                let noteHtml = '';
+                if (log.note) {
+                    // 桌面端放宽截断限制（从 30 改为 80 字符），附注列会自然占满剩余空间
+                    const safeNote = Utils.escapeHtml(log.note);
+                    const displayText = log.note.length > 80
+                        ? Utils.escapeHtml(log.note.slice(0, 80)) + '…'
+                        : safeNote;
+                    if (log.note.includes('[防爬虫自动封禁]')) {
+                        noteHtml = `<span class="log-note-spider" title="${safeNote}"
+                            style="font-size:11px;background:rgba(224,32,32,0.15);color:var(--accent-red);
+                            border:1px solid rgba(224,32,32,0.35);border-radius:3px;padding:2px 6px;
+                            white-space:nowrap;display:inline-block;">
+                            🕷️ ${displayText}
+                        </span>`;
+                    } else if (log.note.includes('登录失败')) {
+                        noteHtml = `<span class="log-note-brute" title="${safeNote}">🔑 ${displayText}</span>`;
+                    } else {
+                        noteHtml = `<span class="log-note" title="${safeNote}">${displayText}</span>`;
+                    }
+                }
 
-        // 封禁按钮事件
+                tr.innerHTML = `
+                    <td>${Utils.formatTime(log.timestamp)}</td>
+                    <td style="font-family:monospace;">${Utils.escapeHtml(log.ip)}</td>
+                    <td>${Utils.escapeHtml(log.method)}</td>
+                    <td class="log-path">${Utils.escapeHtml(log.path)}</td>
+                    <td><span class="status-badge ${statusClass}">${log.status}</span></td>
+                    <td class="log-note-cell">${noteHtml}</td>
+                    <td><button class="btn btn-sm btn-danger" data-ban-ip="${Utils.escapeHtml(log.ip)}" data-log-idx="${idx}">封禁</button></td>`;
+                tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+            container.appendChild(table);
+        }
+
         container.querySelectorAll('[data-ban-ip]').forEach(btn => {
-            btn.addEventListener('click', () => this._showBanDialog(btn.dataset.banIp));
+            btn.addEventListener('click', () => {
+                const logIdx = btn.dataset.logIdx;
+                const logEntry = (logIdx !== undefined && logs[parseInt(logIdx)]) ? logs[parseInt(logIdx)] : null;
+                this._showBanDialog(btn.dataset.banIp, logEntry);
+            });
         });
 
         this._renderPagination(total, this._accessLogPage);
@@ -449,7 +566,7 @@ const App = {
         container.appendChild(info);
 
         const actions = document.createElement('div');
-        actions.style.cssText = 'display:flex;gap:4px;';
+        actions.style.cssText = 'display:flex;gap:8px;';
 
         if (currentPage > 1) {
             const prev = document.createElement('button');
@@ -474,8 +591,9 @@ const App = {
         container.appendChild(actions);
     },
 
-    /** 显示封禁 IP 弹窗 */
-    _showBanDialog(ip = '') {
+    /** 显示封禁 IP 弹窗，entry 为可选的访问日志条目（用于预填原因） */
+    _showBanDialog(ip = '', entry = null) {
+        const initialReason = entry && entry.note ? entry.note : '';
         const overlay = document.createElement('div');
         overlay.className = 'confirm-overlay';
         overlay.innerHTML = `
@@ -483,7 +601,7 @@ const App = {
                 <h3 style="margin-bottom:12px;">封禁 IP</h3>
                 <div style="display:flex;flex-direction:column;gap:8px;">
                     <input type="text" id="ban-ip-input" placeholder="IP 地址" value="${Utils.escapeHtml(ip)}">
-                    <input type="text" id="ban-reason-input" placeholder="封禁原因（可选）" value="手动封禁">
+                    <input type="text" id="ban-reason-input" placeholder="封禁原因（可选）" value="${Utils.escapeHtml(initialReason)}">
                     <div style="display:flex;align-items:center;gap:8px;">
                         <label style="white-space:nowrap;font-size:13px;">封禁时长</label>
                         <select id="ban-duration-select" style="flex:1;">
@@ -587,6 +705,7 @@ const App = {
                 <span class="security-readonly-banner-icon">🔒</span>
                 <span class="security-readonly-banner-text">
                     以下配置属于安全敏感项，出于安全考虑不允许在 Web 端修改。<br>
+                    其中也包括心跳探测频率/重试策略，这些参数会直接影响会话失效探测与防护行为。<br>
                     如需调整，请前往 <strong>AstrBot 平台 → 插件配置</strong> 中对应的传统配置项进行修改。
                 </span>
             </div>
@@ -594,6 +713,17 @@ const App = {
             <div id="sec-readonly-content" class="hidden" style="display:flex;flex-direction:column;gap:8px;"></div>`;
         container.appendChild(secSection);
         this._loadSecReadonly();
+
+        // ---- 会话心跳状态区 ----
+        const heartbeatSection = document.createElement('div');
+        heartbeatSection.className = 'settings-section';
+        heartbeatSection.innerHTML = `
+            <h3>💓 会话心跳状态</h3>
+            <div id="heartbeat-status-loading" class="chart-empty" style="padding:12px;">加载中...</div>
+            <div id="heartbeat-status-content" class="hidden" style="display:flex;flex-direction:column;gap:8px;"></div>`;
+        container.appendChild(heartbeatSection);
+        this._loadHeartbeatStatus();
+
 
         // ---- 修改密码区 ----
         const pwSection = document.createElement('div');
@@ -799,6 +929,20 @@ const App = {
             });
         }
 
+        // ---- 桌面端兼容区 ----
+        const desktopSection = document.createElement('div');
+        desktopSection.className = 'settings-section';
+        desktopSection.innerHTML = `
+            <h3>🖥️ 桌面端兼容</h3>
+            <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px;line-height:1.7;">
+                AstrBot 桌面端（Desktop Edition）使用 Tauri 托管后端进程，重启机制与标准版不同。<br>
+                插件支持自动检测运行环境，也可手动指定。修改后需 <strong>保存并重启插件</strong> 生效。
+            </p>
+            <div id="desktop-loading" class="chart-empty" style="padding:12px;">加载中...</div>
+            <div id="desktop-content" class="hidden" style="display:flex;flex-direction:column;gap:12px;max-width:500px;"></div>`;
+        container.appendChild(desktopSection);
+        this._loadDesktopConfig();
+
         // ---- Web 面板可调配置区 ----
         const webCfgSection = document.createElement('div');
         webCfgSection.className = 'settings-section';
@@ -825,9 +969,9 @@ const App = {
                 - <strong>黑名单模式</strong>：名单中的 IP 被阻止访问（未在黑名单内的 IP 仍受封禁检查约束）<br>
                 - <strong>受保护 IP</strong>：优先级最高，永远放行，不受任何机制影响。<strong>只能通过 AstrBot 传统配置修改</strong>，防止面板被攻破后遭篡改<br>
                 <br>
-                <strong>总开关 / 端口 / 监听地址 / 密码重置</strong>：这些配置出于安全考虑只能通过 AstrBot 插件配置页修改，上方「安全敏感配置」区展示了其当前值供参考。<br>
+                <strong>总开关 / 端口 / 监听地址 / 密码重置 / 信任代理 / IP 绑定 / 心跳频率</strong>：这些配置出于安全考虑只能通过 AstrBot 插件配置页修改，上方「安全敏感配置」区展示了其当前值供参考。<br>
                 <br>
-                <strong>日志清理 / 防爬虫 / 信任反向代理</strong>：在「Web 面板运行配置」区可直接修改，修改后需保存并重启插件。
+                <strong>日志清理 / 防爬虫 / 已登录请求限速</strong>：在「Web 面板运行配置」区可直接修改，修改后需保存并重启插件。
             </p>`;
         container.appendChild(infoSection);
     },
@@ -856,6 +1000,12 @@ const App = {
             'web_panel_port',
             'web_panel_host',
             'web_panel_reset_password',
+            'web_panel_trust_proxy',
+            'web_panel_ip_bind_check',
+            'web_panel_heartbeat_visible_interval_seconds',
+            'web_panel_heartbeat_hidden_interval_seconds',
+            'web_panel_heartbeat_retry_base_seconds',
+            'web_panel_heartbeat_retry_max_seconds',
         ];
 
         readonlyKeys.forEach(key => {
@@ -869,12 +1019,145 @@ const App = {
                 ? (val ? '已开启' : '已关闭')
                 : (val === '' ? '（空）' : String(val));
             const desc = (s.description || key).replace(/^[^\s]+\s/, '');
+            const readonlyNote = (key.startsWith('web_panel_heartbeat_') || key === 'web_panel_ip_bind_check' || key === 'web_panel_trust_proxy')
+                ? '⚠️ 此项属于 Web 安全敏感配置，请在 AstrBot 平台插件配置页修改'
+                : '⚠️ 此项为安全敏感配置，请在 AstrBot 平台插件配置页修改';
             row.innerHTML = `
                 <div class="config-field-label">🔒 ${desc}</div>
                 <div class="config-field-readonly-value">当前值：${displayVal}</div>
-                <div class="config-field-readonly-note">⚠️ 此项为安全敏感配置，请在 AstrBot 平台插件配置页修改</div>`;
+                <div class="config-field-readonly-note">${readonlyNote}</div>`;
             content.appendChild(row);
         });
+    },
+
+
+
+    /** 加载桌面端兼容配置 */
+    async _loadDesktopConfig() {
+        const loading = document.getElementById('desktop-loading');
+        const content = document.getElementById('desktop-content');
+        if (!loading || !content) return;
+
+        const res = await Api.getConfig();
+        if (!res.ok) {
+            loading.textContent = '加载失败';
+            return;
+        }
+
+        loading.classList.add('hidden');
+        content.classList.remove('hidden');
+        content.style.display = 'flex';
+
+        const cfg = res.config || {};
+        const schema = res.schema || {};
+        const desktopInfo = res.desktop_info || {};
+
+        // 当前检测状态指示
+        const statusRow = document.createElement('div');
+        statusRow.style.cssText = 'padding:10px 14px;border-radius:8px;font-size:13px;line-height:1.6;';
+        if (desktopInfo.is_desktop) {
+            statusRow.style.background = 'rgba(59,130,246,0.08)';
+            statusRow.style.border = '1px solid rgba(59,130,246,0.25)';
+            statusRow.innerHTML = `
+                <strong>🖥️ 当前环境：桌面端</strong><br>
+                <span style="font-size:12px;color:var(--text-secondary);">
+                    检测模式：${desktopInfo.mode_setting || 'auto'}<br>
+                    检测依据：${desktopInfo.detected_env || '—'}
+                </span>`;
+        } else {
+            statusRow.style.background = 'rgba(34,197,94,0.08)';
+            statusRow.style.border = '1px solid rgba(34,197,94,0.25)';
+            statusRow.innerHTML = `
+                <strong>📦 当前环境：标准版</strong><br>
+                <span style="font-size:12px;color:var(--text-secondary);">
+                    检测模式：${desktopInfo.mode_setting || 'auto'}<br>
+                    检测结果：未检测到桌面端特征
+                </span>`;
+        }
+        content.appendChild(statusRow);
+
+        // desktop_mode 可编辑选择
+        const modeSchema = schema['desktop_mode'];
+        if (modeSchema) {
+            const modeRow = document.createElement('div');
+            modeRow.className = 'config-field';
+            modeRow.style.maxWidth = '500px';
+            const currentMode = cfg['desktop_mode'] || 'auto';
+            const modeLabels = {
+                'auto': 'auto — 自动检测（推荐）',
+                'force_desktop': 'force_desktop — 强制桌面端模式',
+                'force_standard': 'force_standard — 强制标准版模式'
+            };
+            const label = document.createElement('div');
+            label.className = 'config-field-label';
+            label.textContent = '桌面端模式';
+            modeRow.appendChild(label);
+
+            const hint = document.createElement('div');
+            hint.className = 'config-field-hint';
+            hint.textContent = '控制插件如何识别运行环境。auto=多重策略自动检测，force_desktop=强制桌面端，force_standard=强制标准版';
+            modeRow.appendChild(hint);
+
+            const select = document.createElement('select');
+            select.className = 'config-select';
+            select.style.marginTop = '6px';
+            (modeSchema.options || ['auto', 'force_desktop', 'force_standard']).forEach(opt => {
+                const o = document.createElement('option');
+                o.value = opt;
+                o.textContent = modeLabels[opt] || opt;
+                if (opt === currentMode) o.selected = true;
+                select.appendChild(o);
+            });
+            modeRow.appendChild(select);
+            content.appendChild(modeRow);
+
+            // desktop_detected_env 只读
+            const detectedRow = document.createElement('div');
+            detectedRow.className = 'config-field config-field-readonly';
+            detectedRow.style.maxWidth = '500px';
+            const detectedVal = cfg['desktop_detected_env'] || '（未检测）';
+            detectedRow.innerHTML = `
+                <div class="config-field-label">🔒 自动检测结果</div>
+                <div class="config-field-readonly-value">当前值：${detectedVal}</div>
+                <div class="config-field-readonly-note">此项由插件自动检测并写入，无需手动修改</div>`;
+            content.appendChild(detectedRow);
+
+            // 保存按钮
+            const saveRow = document.createElement('div');
+            saveRow.style.cssText = 'display:flex;gap:8px;align-items:center;margin-top:4px;';
+            const saveBtn = document.createElement('button');
+            saveBtn.className = 'btn btn-primary btn-sm';
+            saveBtn.textContent = '保存并重启插件';
+            const statusEl = document.createElement('span');
+            statusEl.style.cssText = 'font-size:12px;color:var(--text-secondary);';
+            saveRow.appendChild(saveBtn);
+            saveRow.appendChild(statusEl);
+            content.appendChild(saveRow);
+
+            saveBtn.addEventListener('click', async () => {
+                const newMode = select.value;
+                saveBtn.disabled = true;
+                statusEl.textContent = '保存中...';
+                const saveRes = await Api.putConfig({ desktop_mode: newMode });
+                if (!saveRes.ok) {
+                    Utils.toast('保存失败：' + (saveRes.msg || '未知错误'), 'error');
+                    statusEl.textContent = '保存失败';
+                    saveBtn.disabled = false;
+                    return;
+                }
+                statusEl.textContent = '已保存，正在重启...';
+                const reloadRes = await Api.reloadPlugin();
+                if (reloadRes && reloadRes.ok) {
+                    Utils.toast('桌面端模式已更新，插件正在重启...', 'success');
+                    statusEl.textContent = '重启中...';
+                    statusEl.style.color = 'var(--accent)';
+                } else {
+                    Utils.toast('配置已保存，但触发重启失败，请手动重启', 'warning');
+                    statusEl.textContent = '请手动重启';
+                    saveBtn.disabled = false;
+                }
+            });
+        }
     },
 
     /** 加载 Web 面板可调配置（日志清理、防爬虫、信任代理） */
@@ -897,13 +1180,13 @@ const App = {
 
         // 可调项定义（key → 覆盖标签，留空则用 schema.description）
         const editableKeys = [
-            'web_panel_trust_proxy',
             'web_panel_log_auto_clean',
             'web_panel_log_retention_days',
             'web_panel_log_clean_interval_hours',
             'web_panel_anti_spider',
             'web_panel_anti_spider_rate_limit',
             'web_panel_anti_spider_ban_duration',
+            'web_panel_authenticated_rate_limit',
         ];
 
         const pending = {};
@@ -1016,8 +1299,7 @@ const App = {
             saveBtn.textContent = '保存中...';
             statusEl.textContent = '';
 
-            const merged = { ...cfg, ...pending };
-            const res = await Api.reloadPlugin(merged);
+            const res = await Api.reloadPlugin(pending);
             saveBtn.disabled = false;
             saveBtn.textContent = '保存并重启插件';
 
@@ -1071,6 +1353,7 @@ const App = {
 
     _fileEditorDirty: false,
     _currentFilePath: null,
+    _currentFileMeta: null,
 
     /** 渲染文件浏览器 */
     async _renderFileBrowser() {
@@ -1096,7 +1379,7 @@ const App = {
         editorPanel.innerHTML = `
             <div class="file-editor-header">
                 <span id="file-editor-title" style="font-size:14px;font-weight:600;">选择文件查看内容</span>
-                <div id="file-editor-actions" class="hidden" style="display:flex;gap:6px;">
+                <div id="file-editor-actions" class="file-editor-actions hidden">
                     <span id="file-editor-size" style="font-size:12px;color:var(--text-secondary);align-self:center;"></span>
                     <button class="btn btn-sm btn-primary" id="btn-save-file">保存</button>
                     <button class="btn btn-sm btn-danger" id="btn-delete-file">删除</button>
@@ -1133,7 +1416,12 @@ const App = {
             return;
         }
 
-        // 按目录分组
+        const statusMeta = {
+            protected: { label: '受保护', className: 'file-status--protected' },
+            editable: { label: '可编辑', className: 'file-status--editable' },
+            delete_only: { label: '仅删除', className: 'file-status--readonly' },
+        };
+
         const groups = {};
         files.forEach(f => {
             const dir = f.directory || '根目录';
@@ -1162,12 +1450,18 @@ const App = {
                 item.className = 'file-item';
                 if (f.protected) item.classList.add('file-protected');
                 if (this._currentFilePath === f.path) item.classList.add('active');
-                const icon = f.protected ? '🔒' : f.is_json ? '{}' : '📄';
+                const icon = f.protected ? '🔒' : f.is_json ? '{}' : (f.is_text ? '📝' : '📄');
+                const meta = statusMeta[f.status] || statusMeta.delete_only;
                 item.innerHTML = `
                     <span class="file-icon">${icon}</span>
-                    <span class="file-name" title="${Utils.escapeHtml(f.path)}">${Utils.escapeHtml(f.name)}</span>
-                    <span class="file-size">${Utils.formatSize(f.size)}</span>`;
-                item.addEventListener('click', () => this._openFile(f.path, f.protected));
+                    <div class="file-item-main">
+                        <span class="file-name" title="${Utils.escapeHtml(f.path)}">${Utils.escapeHtml(f.name)}</span>
+                        <div class="file-item-subline">
+                            <span class="file-size">${Utils.formatSize(f.size)}</span>
+                            <span class="file-status ${meta.className}">${meta.label}</span>
+                        </div>
+                    </div>`;
+                item.addEventListener('click', () => this._openFile(f));
                 filesList.appendChild(item);
             });
             dirEl.appendChild(filesList);
@@ -1176,22 +1470,26 @@ const App = {
     },
 
     /** 打开文件 */
-    async _openFile(path, isProtected) {
+    async _openFile(fileMeta) {
+        const path = fileMeta?.path;
+        if (!path) return;
         if (this._fileEditorDirty) {
             const ok = await Utils.confirm('当前文件有未保存的修改，确定放弃？');
             if (!ok) return;
         }
 
         this._currentFilePath = path;
+        this._currentFileMeta = fileMeta;
         this._fileEditorDirty = false;
         const content = document.getElementById('file-editor-content');
         const title = document.getElementById('file-editor-title');
         const actions = document.getElementById('file-editor-actions');
         const sizeEl = document.getElementById('file-editor-size');
+        const saveBtn = document.getElementById('btn-save-file');
+        const deleteBtn = document.getElementById('btn-delete-file');
 
         title.textContent = path;
 
-        // 高亮当前文件
         document.querySelectorAll('.file-item').forEach(el => el.classList.remove('active'));
         document.querySelectorAll('.file-item').forEach(el => {
             if (el.querySelector('.file-name')?.title === path) {
@@ -1199,13 +1497,12 @@ const App = {
             }
         });
 
-        // 敏感文件：不请求内容，直接显示提示
-        if (isProtected) {
+        if (fileMeta.protected) {
             actions.classList.add('hidden');
             content.innerHTML = `<div class="chart-empty" style="margin:auto;text-align:center;line-height:1.8;">
                 <div style="font-size:32px;margin-bottom:8px;">🔒</div>
-                <div style="font-weight:600;">此文件包含敏感凭据信息</div>
-                <div style="color:var(--text-secondary);font-size:13px;">出于安全考虑，不支持在线查看、编辑或删除。<br>如需查看，请前往服务器本地对应目录手动打开。</div>
+                <div style="font-weight:600;">此文件受保护</div>
+                <div style="color:var(--text-secondary);font-size:13px;">出于安全考虑，不支持在线查看、编辑或删除。<br>如需处理，请前往服务器本地对应目录手动操作。</div>
             </div>`;
             return;
         }
@@ -1219,29 +1516,34 @@ const App = {
             return;
         }
 
+        this._currentFileMeta = { ...fileMeta, ...res };
         actions.classList.remove('hidden');
         actions.style.display = 'flex';
         sizeEl.textContent = Utils.formatSize(res.content.length);
-
-        // 判断是否可编辑（JSON 文件）
-        const isEditable = res.is_json;
-        const saveBtn = document.getElementById('btn-save-file');
-        saveBtn.classList.toggle('hidden', !isEditable);
+        saveBtn.classList.toggle('hidden', !res.can_edit);
+        deleteBtn.classList.toggle('hidden', !res.can_delete);
 
         content.innerHTML = '';
         const textarea = document.createElement('textarea');
         textarea.className = 'file-textarea';
         textarea.spellcheck = false;
-        textarea.readOnly = !isEditable;
+        textarea.readOnly = !res.can_edit;
 
-        // JSON 文件格式化显示
         if (res.is_json && res.parsed !== null) {
             textarea.value = JSON.stringify(res.parsed, null, 2);
         } else {
             textarea.value = res.content;
         }
 
+        if (!res.can_edit) {
+            const readonlyHint = document.createElement('div');
+            readonlyHint.className = 'file-editor-hint';
+            readonlyHint.textContent = '该文件可查看，但当前不支持在线编辑。';
+            content.appendChild(readonlyHint);
+        }
+
         textarea.addEventListener('input', () => {
+            if (!res.can_edit) return;
             this._fileEditorDirty = true;
             title.textContent = path + ' (已修改)';
         });
@@ -1250,7 +1552,7 @@ const App = {
 
     /** 保存当前文件 */
     async _saveCurrentFile() {
-        if (!this._currentFilePath) return;
+        if (!this._currentFilePath || !this._currentFileMeta?.can_edit) return;
         const textarea = document.querySelector('.file-textarea');
         if (!textarea) return;
 
@@ -1265,15 +1567,25 @@ const App = {
         if (res.ok) {
             Utils.toast(res.msg || '保存成功', 'success');
             this._fileEditorDirty = false;
+            this._currentFileMeta = { ...this._currentFileMeta, ...res };
             document.getElementById('file-editor-title').textContent = this._currentFilePath;
         } else {
+            if (res.msg && (res.msg.includes('不存在') || res.msg.includes('已删除'))) {
+                this._currentFileMeta = null;
+                this._fileEditorDirty = false;
+                document.getElementById('file-editor-title').textContent = '选择文件查看内容';
+                document.getElementById('file-editor-content').innerHTML =
+                    '<div class="chart-empty" style="margin:auto;">文件已不存在，请刷新列表后重新打开</div>';
+                document.getElementById('file-editor-actions').classList.add('hidden');
+                await this._loadFileList();
+            }
             Utils.toast(res.msg || '保存失败', 'error');
         }
     },
 
     /** 删除当前文件 */
     async _deleteCurrentFile() {
-        if (!this._currentFilePath) return;
+        if (!this._currentFilePath || !this._currentFileMeta?.can_delete) return;
         const ok = await Utils.confirm(`确认删除文件 "${this._currentFilePath}"？此操作不可恢复。`);
         if (!ok) return;
 
@@ -1281,6 +1593,7 @@ const App = {
         if (res.ok) {
             Utils.toast(res.msg || '已删除', 'success');
             this._currentFilePath = null;
+            this._currentFileMeta = null;
             this._fileEditorDirty = false;
             document.getElementById('file-editor-title').textContent = '选择文件查看内容';
             document.getElementById('file-editor-content').innerHTML =
@@ -1288,6 +1601,16 @@ const App = {
             document.getElementById('file-editor-actions').classList.add('hidden');
             await this._loadFileList();
         } else {
+            if (res.msg && (res.msg.includes('不存在') || res.msg.includes('已删除'))) {
+                this._currentFilePath = null;
+                this._currentFileMeta = null;
+                this._fileEditorDirty = false;
+                document.getElementById('file-editor-title').textContent = '选择文件查看内容';
+                document.getElementById('file-editor-content').innerHTML =
+                    '<div class="chart-empty" style="margin:auto;">文件已不存在，请刷新列表后重试</div>';
+                document.getElementById('file-editor-actions').classList.add('hidden');
+                await this._loadFileList();
+            }
             Utils.toast(res.msg || '删除失败', 'error');
         }
     },
@@ -1307,8 +1630,524 @@ const App = {
             section.style.opacity = '1';
             label.textContent = '黑名单 IP';
         }
+    },
+
+    _ensureConfigBadge() {
+        if (document.getElementById('config-file-badge')) return;
+        const badge = document.createElement('div');
+        badge.id = 'config-file-badge';
+        badge.className = 'config-file-badge hidden';
+        badge.innerHTML = `
+            <div class="config-file-badge__row">
+                <span class="config-file-badge__label">配置文件</span>
+                <span class="config-file-badge__value"></span>
+            </div>
+            <button class="config-file-badge__download" title="点击下载配置文件" aria-label="下载配置文件">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+            </button>`;
+        document.body.appendChild(badge);
+
+        // 绑定下载事件
+        const downloadBtn = badge.querySelector('.config-file-badge__download');
+        if (downloadBtn) {
+            downloadBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this._downloadCurrentConfig();
+            });
+        }
+    },
+
+    _updateConfigBadgeVisibility() {
+        const badge = document.getElementById('config-file-badge');
+        if (!badge) return;
+        const visibleViews = new Set(['tech-tree', 'settings']);
+        const shouldShow = visibleViews.has(this._currentView) && !!this._configFileName && !this._configPanelOpen;
+        badge.classList.toggle('hidden', !shouldShow);
+        const valueEl = badge.querySelector('.config-file-badge__value');
+        if (valueEl) valueEl.textContent = this._configFileName || '—';
+        // 隐藏状态下禁用下载按钮
+        const downloadBtn = badge.querySelector('.config-file-badge__download');
+        if (downloadBtn) {
+            downloadBtn.disabled = !shouldShow;
+        }
+    },
+
+    /** 下载当前配置文件（安全加固：不暴露服务器路径）
+     *
+     *  一次 fetch 完成预检 + 获取内容，由前端构建 Blob 触发下载。
+     *  服务端返回纯 JSON（不含 Content-Disposition），
+     *  避免 Content-Disposition: attachment 在 fetch 阶段干扰浏览器。
+     */
+    async _downloadCurrentConfig() {
+        const downloadBtn = document.querySelector('.config-file-badge__download');
+        const resetBtn = () => {
+            if (downloadBtn) {
+                downloadBtn.disabled = false;
+                downloadBtn.classList.remove('config-file-badge__download--loading');
+            }
+        };
+
+        if (downloadBtn) {
+            downloadBtn.disabled = true;
+            downloadBtn.classList.add('config-file-badge__download--loading');
+        }
+
+        let resp;
+        try {
+            resp = await fetch('/api/config/download?_=' + Date.now(), {
+                method: 'GET',
+                credentials: 'same-origin',
+            });
+        } catch (e) {
+            resetBtn();
+            Utils.alert(
+                '下载失败\n\n' +
+                '网络错误：无法连接到服务器（' + (e.message || '未知错误') + '）\n\n' +
+                '可能原因：\n' +
+                '- 网络连接异常，请检查服务器是否在线、端口是否可达\n' +
+                '- 服务器暂时不可用或正在重启中\n' +
+                '- 若使用了反向代理，请确认未拦截 /api/config/download 路径\n' +
+                '- 浏览器插件或防火墙拦截了请求\n' +
+                '- 若使用 Docker 部署，请确认容器端口映射正确'
+            );
+            return;
+        }
+
+        if (!resp.ok) {
+            let errMsg = 'HTTP ' + resp.status;
+            try { const body = await resp.json(); errMsg = body.msg || errMsg; } catch (_) {}
+            if (resp.status === 401) {
+                Api.clearToken();
+                Api.emitAuthEvent('unauthorized', { msg: errMsg });
+            }
+            resetBtn();
+            // 根据状态码给出针对性排查建议
+            let hint = '';
+            if (resp.status === 401) {
+                hint = '会话已过期或密码已修改，请刷新页面重新登录';
+            } else if (resp.status === 403) {
+                hint = '服务端拒绝了下载请求（文件名校验不通过或权限不足），请检查 AstrBot 日志';
+            } else if (resp.status === 404) {
+                hint = '配置文件尚未生成，请确认插件已完全启动并完成首次配置加载';
+            } else if (resp.status >= 500) {
+                hint = '服务端内部错误，请查看 AstrBot 日志排查具体异常';
+            } else {
+                hint = '请查看 Web 面板访问日志获取详细错误信息';
+            }
+            Utils.alert(
+                '下载失败\n\n' +
+                errMsg + '\n\n' +
+                '错误说明：' + hint + '\n\n' +
+                '排查步骤：\n' +
+                '1. 检查 AstrBot 控制台日志中是否有相关错误输出\n' +
+                '2. 在 Web 面板「访问日志」页面查看下载请求的状态和附注\n' +
+                '3. 确认当前登录会话有效（可尝试刷新页面重新登录）\n' +
+                '4. 若使用反向代理，确认 /api/config/download 路径已被正确转发\n' +
+                '5. 若问题持续，请在 GitHub Issues 反馈并附上相关日志'
+            );
+            return;
+        }
+
+        // 解析服务端返回的 JSON 中的文件内容，由前端构建 Blob 下载
+        let data;
+        try {
+            data = await resp.json();
+        } catch (e) {
+            resetBtn();
+            Utils.alert(
+                '下载失败\n\n' +
+                '服务端返回了无效的数据格式，JSON 解析失败\n\n' +
+                '可能原因：\n' +
+                '- 服务端响应被中间设备（代理/防火墙）篡改\n' +
+                '- 配置文件包含非标准字符导致编码异常\n' +
+                '- 服务端内部异常导致返回了非 JSON 内容\n\n' +
+                '请检查 AstrBot 日志和 Web 面板访问日志获取详细错误信息'
+            );
+            return;
+        }
+
+        if (!data || !data.ok || !data.content) {
+            resetBtn();
+            Utils.alert(
+                '下载失败\n\n' +
+                (data && data.msg ? data.msg : '服务端返回了不完整的响应数据') + '\n\n' +
+                '可能原因：\n' +
+                '- 配置文件内容为空（刚初始化尚未写入配置）\n' +
+                '- 服务端读取配置文件时发生 I/O 异常\n' +
+                '- 配置文件被外部进程锁定无法读取\n\n' +
+                '请检查 AstrBot 日志和 Web 面板访问日志获取详细错误信息'
+            );
+            return;
+        }
+
+        // 构建 Blob 并触发浏览器下载
+        const blob = new Blob([data.content], { type: 'application/json; charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = data.filename || this._configFileName || 'config.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        resetBtn();
+    },
+
+    setConfigPanelOpen(isOpen) {
+        this._configPanelOpen = !!isOpen;
+        document.body.classList.toggle('config-panel-open', this._configPanelOpen);
+        this._updateConfigBadgeVisibility();
+    },
+
+    _normalizeHeartbeatSeconds(value, fallback, minValue) {
+        const num = Number(value);
+        if (!Number.isFinite(num) || num < minValue) return fallback;
+        return Math.round(num) * 1000;
+    },
+
+    _buildHeartbeatConfig(config) {
+        return {
+            visibleIntervalMs: this._normalizeHeartbeatSeconds(
+                config.web_panel_heartbeat_visible_interval_seconds,
+                300,
+                30,
+            ),
+            hiddenIntervalMs: this._normalizeHeartbeatSeconds(
+                config.web_panel_heartbeat_hidden_interval_seconds,
+                1200,
+                60,
+            ),
+            retryBaseIntervalMs: this._normalizeHeartbeatSeconds(
+                config.web_panel_heartbeat_retry_base_seconds,
+                15,
+                5,
+            ),
+            retryMaxIntervalMs: this._normalizeHeartbeatSeconds(
+                config.web_panel_heartbeat_retry_max_seconds,
+                120,
+                15,
+            ),
+        };
+    },
+
+    _createHeartbeatReadonlyRows(cfg, schema) {
+        const readonlyKeys = [
+            'web_panel_heartbeat_visible_interval_seconds',
+            'web_panel_heartbeat_hidden_interval_seconds',
+            'web_panel_heartbeat_retry_base_seconds',
+            'web_panel_heartbeat_retry_max_seconds',
+        ];
+        const rows = [];
+        readonlyKeys.forEach((key) => {
+            const s = schema[key];
+            if (!s) return;
+            const val = key in cfg ? cfg[key] : (s.default !== undefined ? s.default : '—');
+            const displayVal = val === '' ? '（空）' : String(val);
+            const desc = (s.description || key).replace(/^[^\s]+\s/, '');
+            rows.push(`
+                <div class="config-field config-field-readonly" style="max-width:500px;">
+                    <div class="config-field-label">🔒 ${desc}</div>
+                    <div class="config-field-readonly-value">当前值：${displayVal}</div>
+                    <div class="config-field-readonly-note">⚠️ 心跳探测频率属于安全敏感配置，请在 AstrBot 平台插件配置页修改</div>
+                </div>`);
+        });
+        return rows.join('');
+    },
+
+    async _loadHeartbeatStatus() {
+        const loading = document.getElementById('heartbeat-status-loading');
+        const content = document.getElementById('heartbeat-status-content');
+        if (!loading || !content) return;
+
+        const verify = await Api.verify();
+        if (!verify.ok) {
+            loading.textContent = '加载失败';
+            return;
+        }
+
+        const cfgRes = await Api.getConfig();
+        const cfg = cfgRes && cfgRes.ok ? (cfgRes.config || {}) : {};
+        const heartbeatCfg = this._buildHeartbeatConfig(cfg);
+
+        loading.classList.add('hidden');
+        content.classList.remove('hidden');
+        content.style.display = 'flex';
+
+        const statusBadgeMap = {
+            idle: '<span class="heartbeat-status-badge heartbeat-status-badge--idle">idle（尚未开始）</span>',
+            ok: '<span class="heartbeat-status-badge heartbeat-status-badge--ok">ok（正常）</span>',
+            retrying: '<span class="heartbeat-status-badge heartbeat-status-badge--retrying">retrying（重试中）</span>',
+            invalid: '<span class="heartbeat-status-badge heartbeat-status-badge--invalid">invalid（会话失效）</span>',
+            stopped: '<span class="heartbeat-status-badge heartbeat-status-badge--stopped">stopped（已停止）</span>',
+        };
+
+        const rows = [
+            ['当前会话 ID', verify.session_id || '—'],
+            ['当前设备 ID', verify.device_id || '—'],
+            ['前台心跳间隔', `${Math.round(heartbeatCfg.visibleIntervalMs / 1000)} 秒`],
+            ['后台心跳间隔', `${Math.round(heartbeatCfg.hiddenIntervalMs / 1000)} 秒`],
+            ['失败重试基准', `${Math.round(heartbeatCfg.retryBaseIntervalMs / 1000)} 秒`],
+            ['失败重试上限', `${Math.round(heartbeatCfg.retryMaxIntervalMs / 1000)} 秒`],
+            ['当前标签页角色', this._authMonitor?.leader ? '<span class="heartbeat-status-badge heartbeat-status-badge--ok">Leader（负责发心跳）</span>' : '<span class="heartbeat-status-badge heartbeat-status-badge--idle">Follower（仅监听广播）</span>'],
+            ['当前心跳状态', statusBadgeMap[this._authMonitor?.lastHeartbeatStatus || 'idle'] || statusBadgeMap.idle],
+            ['最近一次心跳成功', this._authMonitor?.lastHeartbeatSuccessAt ? new Date(this._authMonitor.lastHeartbeatSuccessAt).toLocaleString() : '尚未成功'],
+            ['缓冲重试期', (this._authMonitor?.consecutiveNetworkFailures || 0) > 0 ? `<span class="heartbeat-status-badge heartbeat-status-badge--retrying">是（连续失败 ${this._authMonitor.consecutiveNetworkFailures} 次）</span>` : '<span class="heartbeat-status-badge heartbeat-status-badge--ok">否</span>'],
+            ['会话剩余时间', verify.ttl_seconds != null ? `${verify.ttl_seconds} 秒` : '—'],
+        ];
+
+        content.innerHTML = rows.map(([label, value]) => `
+            <div class="config-field config-field-readonly" style="max-width:500px;">
+                <div class="config-field-label">${label}</div>
+                <div class="config-field-readonly-value heartbeat-status-value">${value}</div>
+            </div>`).join('');
+    },
+
+    _redirectToLogin(reason, message, options = {}) {
+        Api.clearToken();
+        this._authMonitor?.stop?.();
+        const { showAlert = true } = options;
+        const redirect = () => {
+            window.location.href = '/';
+        };
+        if (!showAlert || !message || typeof Utils === 'undefined') {
+            redirect();
+            return;
+        }
+        Utils.alert(message).then(redirect).catch(redirect);
+    },
+
+    _installAuthMonitor(config = {}) {
+        if (this._authMonitor) return;
+        const channelName = 'gcp-auth';
+        const tabId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const leaderKey = 'gcp_auth_leader';
+        const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel(channelName) : null;
+        const heartbeatConfig = {
+            visibleIntervalMs: config.visibleIntervalMs || 5 * 60 * 1000,
+            hiddenIntervalMs: config.hiddenIntervalMs || 20 * 60 * 1000,
+            retryBaseIntervalMs: config.retryBaseIntervalMs || 15 * 1000,
+            retryMaxIntervalMs: config.retryMaxIntervalMs || 2 * 60 * 1000,
+        };
+        const monitor = {
+            timer: null,
+            leaderTimer: null,
+            leader: false,
+            running: false,
+            authenticated: false,
+            inFlight: false,
+            lastHeartbeatSuccessAt: 0,
+            lastHeartbeatStatus: 'idle',
+            // 正常巡检频率允许由传统配置项控制；这里只负责应用当前生效值。
+            visibleInterval: heartbeatConfig.visibleIntervalMs,
+            hiddenInterval: heartbeatConfig.hiddenIntervalMs,
+            jitter: 30 * 1000,
+            // 网络异常时启用短周期重试，避免一次超时就误判断线。
+            retryBaseInterval: heartbeatConfig.retryBaseIntervalMs,
+            retryMaxInterval: heartbeatConfig.retryMaxIntervalMs,
+            consecutiveNetworkFailures: 0,
+            broadcast(type, detail = {}) {
+                const payload = { type, detail, tabId, ts: Date.now() };
+                if (channel) channel.postMessage(payload);
+                try {
+                    localStorage.setItem('gcp_auth_event', JSON.stringify(payload));
+                } catch (e) {
+                    console.warn('广播会话事件失败:', e);
+                }
+            },
+            // 只有 leader 标签页会真正发起心跳；其余标签页只监听结果广播，
+            // 避免同一浏览器多标签重复探活、重复重试。
+            schedule(immediate = false) {
+                clearTimeout(this.timer);
+                if (!this.running || !this.leader || !this.authenticated) return;
+                let delay;
+                if (immediate) {
+                    delay = 0;
+                } else if (this.consecutiveNetworkFailures > 0) {
+                    const retryDelay = this.retryBaseInterval * Math.pow(2, this.consecutiveNetworkFailures - 1);
+                    delay = Math.min(retryDelay, this.retryMaxInterval);
+                } else {
+                    const base = document.visibilityState === 'visible' ? this.visibleInterval : this.hiddenInterval;
+                    const jitter = Math.floor(Math.random() * this.jitter);
+                    delay = base + jitter;
+                }
+                this.timer = setTimeout(() => this.ping(), delay);
+            },
+            startLeaderElection() {
+                const renew = () => {
+                    const lease = { tabId, expiresAt: Date.now() + 90 * 1000 };
+                    try {
+                        const raw = localStorage.getItem(leaderKey);
+                        const current = raw ? JSON.parse(raw) : null;
+                        if (!current || current.expiresAt < Date.now() || current.tabId === tabId) {
+                            localStorage.setItem(leaderKey, JSON.stringify(lease));
+                            this.becomeLeader();
+                        } else if (this.leader) {
+                            this.becomeFollower();
+                        }
+                    } catch (e) {
+                        this.becomeLeader();
+                    }
+                };
+                renew();
+                this.leaderTimer = setInterval(renew, 30 * 1000);
+            },
+            becomeLeader() {
+                if (this.leader) return;
+                this.leader = true;
+                this.schedule(true);
+            },
+            becomeFollower() {
+                this.leader = false;
+                clearTimeout(this.timer);
+            },
+            // 心跳失败分两类：
+            // 1) 401/会话失效：立即广播并跳登录；
+            // 2) 网络/超时：进入缓冲期，按 15s/30s/60s/120s 退避重试，不直接登出。
+            async ping() {
+                if (!this.running || !this.leader || !this.authenticated || this.inFlight) return;
+                this.inFlight = true;
+                try {
+                    const res = await Api.heartbeat();
+                    if (res && res.network_error) {
+                        throw new Error(res.msg || 'network_error');
+                    }
+                    if (!res.ok) {
+                        this.lastHeartbeatStatus = 'invalid';
+                        this.broadcast('session-invalid', res);
+                        App._redirectToLogin(res.reason || 'expired', res.msg || '登录已失效，请重新登录');
+                        return;
+                    }
+                    this.consecutiveNetworkFailures = 0;
+                    this.lastHeartbeatSuccessAt = Date.now();
+                    this.lastHeartbeatStatus = 'ok';
+                    this.broadcast('session-ok', res);
+                } catch (error) {
+                    this.consecutiveNetworkFailures += 1;
+                    this.lastHeartbeatStatus = 'retrying';
+                    if (navigator.onLine === false) {
+                        Utils.toast('网络已离线，稍后会自动重试', 'warning', 2500);
+                    } else if (this.consecutiveNetworkFailures <= 2) {
+                        Utils.toast('与服务器连接异常，正在重试', 'warning', 2500);
+                    } else if (this.consecutiveNetworkFailures === 3) {
+                        Utils.toast('心跳连续失败，已进入缓冲重试期', 'warning', 3000);
+                    }
+                } finally {
+                    this.inFlight = false;
+                    this.schedule();
+                }
+            },
+            handleExternalEvent(payload) {
+                if (!payload || payload.tabId === tabId) return;
+                if (payload.type === 'session-invalid') {
+                    const detail = payload.detail || {};
+                    App._redirectToLogin(detail.reason || 'expired', detail.msg || '登录已失效，请重新登录');
+                }
+                if (payload.type === 'logout') {
+                    App._redirectToLogin('logout', '您已退出登录', { showAlert: false });
+                }
+            },
+            markAuthenticated() {
+                this.authenticated = true;
+                this.running = true;
+                this.lastHeartbeatStatus = 'ok';
+                this.startLeaderElection();
+            },
+            stop() {
+                this.running = false;
+                this.authenticated = false;
+                this.lastHeartbeatStatus = 'stopped';
+                clearTimeout(this.timer);
+                clearInterval(this.leaderTimer);
+                if (this.leader) {
+                    try {
+                        const raw = localStorage.getItem(leaderKey);
+                        const current = raw ? JSON.parse(raw) : null;
+                        if (current && current.tabId === tabId) {
+                            localStorage.removeItem(leaderKey);
+                        }
+                    } catch (e) {
+                        console.warn('清理 leader 租约失败:', e);
+                    }
+                }
+                this.leader = false;
+            },
+        };
+
+        Api.onAuthEvent((event) => {
+            if (event.type === 'unauthorized') {
+                monitor.broadcast('session-invalid', event);
+                App._redirectToLogin(event.reason || 'expired', event.msg || '登录已失效，请重新登录');
+            }
+        });
+
+        if (channel) {
+            channel.onmessage = (event) => monitor.handleExternalEvent(event.data);
+        }
+        window.addEventListener('storage', (event) => {
+            if (event.key === 'gcp_auth_event' && event.newValue) {
+                try {
+                    monitor.handleExternalEvent(JSON.parse(event.newValue));
+                } catch (e) {
+                    console.warn('解析跨标签认证事件失败:', e);
+                }
+            }
+            if (event.key === leaderKey && event.newValue) {
+                try {
+                    const current = JSON.parse(event.newValue);
+                    if (current.tabId !== tabId && monitor.leader) {
+                        monitor.becomeFollower();
+                    }
+                } catch (e) {
+                    console.warn('解析 leader 租约失败:', e);
+                }
+            }
+        });
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && monitor.leader && monitor.authenticated) {
+                monitor.schedule(true);
+            }
+        });
+        window.addEventListener('online', () => {
+            if (monitor.leader && monitor.authenticated) {
+                monitor.schedule(true);
+            }
+        });
+        window.addEventListener('beforeunload', () => {
+            if (monitor.authenticated) {
+                monitor.broadcast('tab-leave');
+            }
+        });
+        this._authMonitor = monitor;
     }
 };
 
 // 启动应用
 document.addEventListener('DOMContentLoaded', () => App.start());
+
+// 移动端：虚拟键盘弹出时确保焦点元素可见
+(function() {
+    if (!window.visualViewport) return;
+
+    let pendingScroll = null;
+    window.visualViewport.addEventListener('resize', () => {
+        if (window.innerWidth >= 768) return;
+        const active = document.activeElement;
+        if (!active) return;
+        const tag = active.tagName.toLowerCase();
+        if (tag !== 'textarea' && tag !== 'input') return;
+
+        clearTimeout(pendingScroll);
+        pendingScroll = setTimeout(() => {
+            const vpH = window.visualViewport.height;
+            const rect = active.getBoundingClientRect();
+            if (rect.bottom > vpH * 0.9 || rect.top > vpH * 0.35) {
+                active.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+            }
+        }, 200);
+    });
+})();

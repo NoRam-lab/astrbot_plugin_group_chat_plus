@@ -12,7 +12,6 @@
 
 import time
 from datetime import datetime
-from typing import Optional, Tuple
 
 from astrbot.api import logger
 from astrbot.core.message.components import Plain
