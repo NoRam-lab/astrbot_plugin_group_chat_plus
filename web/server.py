@@ -324,6 +324,11 @@ class WebPanelServer:
         "web_panel_heartbeat_hidden_interval_seconds",
         "web_panel_heartbeat_retry_base_seconds",
         "web_panel_heartbeat_retry_max_seconds",
+        "web_panel_brute_force_window",
+        "web_panel_brute_force_rate_window",
+        "web_panel_brute_force_rate_count",
+        "web_panel_brute_force_tiers",
+        "web_panel_brute_force_ban_duration",
     }
 
     _CHAT_HISTORY_ALLOWED_KEYS = {
@@ -1280,12 +1285,53 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}
             user_agent=request.headers.get("User-Agent", ""),
         )
         if login_result is None:
-            self.security.record_login_failure(ip)
-            tracker = self.security.brute_force.get(ip)
-            attempts = tracker.attempts if tracker else 0
-            if attempts >= 5:
-                logger.warning(f"🔒 IP {ip} 密码错误第 {attempts} 次，可能遭受暴力破解")
-            request["access_note"] = f"登录失败：密码错误（第{attempts}次）"
+            result = self.security.record_login_failure(ip)
+            action = result.get("action", "recorded")
+            attempts = result.get("attempts", 0)
+            lock_seconds = result.get("lock_seconds", 0)
+
+            # 构建访问日志附注（平台日志由 security.record_login_failure 统一管理）
+            if action == "rate_ban":
+                note = (
+                    f"登录失败：密码错误（频率异常，第{attempts}次，"
+                    f"{result.get('rate_window', 0)}秒内失败{result.get('rate_count', 0)}次，已封禁IP）"
+                )
+            elif action == "permanent_ban":
+                note = f"登录失败：密码错误（第{attempts}次，已达最大阈值，已封禁IP）"
+            elif action == "tier_lock":
+                note = f"登录失败：密码错误（第{attempts}次，已锁定{lock_seconds}秒）"
+            else:
+                note = f"登录失败：密码错误（第{attempts}次）"
+
+            request["access_note"] = note
+
+            if result.get("banned"):
+                ban_duration = self.security.brute_force_ban_duration
+                msg = (
+                    "密码错误次数过多，IP 已被封禁"
+                    if ban_duration == 0
+                    else f"密码错误次数过多，IP 已被封禁 {ban_duration} 秒"
+                )
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "msg": msg,
+                        "locked": True,
+                        "wait_seconds": lock_seconds,
+                    },
+                    status=429,
+                )
+
+            if lock_seconds > 0:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "msg": f"密码错误次数过多，请等待 {lock_seconds} 秒后再试",
+                        "locked": True,
+                        "wait_seconds": lock_seconds,
+                    },
+                    status=429,
+                )
             return web.json_response({"ok": False, "msg": "密码错误"}, status=401)
 
         self.security.reset_login_failures(ip)
@@ -1703,6 +1749,11 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}
             "web_panel_anti_spider_rate_limit",
             "web_panel_anti_spider_ban_duration",
             "web_panel_ip_bind_check",
+            "web_panel_brute_force_window",
+            "web_panel_brute_force_rate_window",
+            "web_panel_brute_force_rate_count",
+            "web_panel_brute_force_tiers",
+            "web_panel_brute_force_ban_duration",
         }
         if security_keys & set(validated.keys()):
             self.security.update_config(file_config)

@@ -564,7 +564,7 @@ AI 决定要回复后，进入回复生成阶段。
 - 吸收后的 prompt 补充内容会进入一个固定的运行时兼容补充区，并为不同片段加上明显边界，避免不同插件提示词混在一起
 - 若仍无法高置信度识别，则进入**保守回退模式**：优先保留当前 `req.system_prompt`，并输出 warning 日志，但**不会中断回复流程**
 
-🆕 v1.2.2：Hook 恢复完成后，会追加 `PLUGIN_CUSTOM_STATIC_INSTRUCTIONS` 中存储的静态系统指令到 `req.system_prompt` 末尾，提高 AI 服务商整块缓存命中率。`req.prompt` 中保留原静态前缀作为安全网。
+🆕 v1.2.2-hotfix.1：Hook 恢复完成后，会追加 `PLUGIN_CUSTOM_STATIC_INSTRUCTIONS` 中存储的静态系统指令到 `req.system_prompt` 末尾，提高 AI 服务商整块缓存命中率。`req.prompt` 中保留原静态前缀作为安全网。
 
 因此：
 - 成功路径下，效果与旧版尽量保持一致

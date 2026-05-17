@@ -3,7 +3,7 @@
 负责调用AI生成回复
 
 作者: Him666233
-版本: v1.2.2
+版本: v1.2.2-hotfix.1
 
 v1.2.0 更新：
 - 改用 event.request_llm() 替代 provider.text_chat()，支持其他插件的钩子注入
@@ -33,7 +33,7 @@ PLUGIN_IMAGE_URLS = "_group_chat_plus_image_urls"
 PLUGIN_FUNC_TOOL = "_group_chat_plus_func_tool"
 # 🔧 存储当前用户消息原文（短字符串），用于向量检索类插件（如 livingmemory）的记忆召回
 PLUGIN_CURRENT_MESSAGE = "_group_chat_plus_current_message"
-# 🆕 v1.2.2: 存储插件静态系统指令，由 on_llm_request 追加到 system_prompt 末尾
+# 🆕 v1.2.2-hotfix.1: 存储插件静态系统指令，由 on_llm_request 追加到 system_prompt 末尾
 PLUGIN_CUSTOM_STATIC_INSTRUCTIONS = "_group_chat_plus_static_instructions"
 
 
@@ -434,7 +434,7 @@ class ReplyHandler:
                 logger.warning(f"获取人格设定失败: {e}，使用空人格")
 
             # 如果有begin_dialogs，将其追加到prompt末尾（不破坏静态前缀缓存）
-            # 🔧 v1.2.2: 从 prompt 开头移到末尾
+            # 🔧 v1.2.2-hotfix.1: 从 prompt 开头移到末尾
             if begin_dialogs_text:
                 full_prompt += begin_dialogs_text
 
@@ -468,7 +468,7 @@ class ReplyHandler:
             event.set_extra(PLUGIN_CUSTOM_SYSTEM_PROMPT, system_prompt)
             # 存储插件自定义的完整 prompt（含历史上下文），供 on_llm_request 钩子恢复使用
             event.set_extra(PLUGIN_CUSTOM_PROMPT, full_prompt)
-            # 🆕 v1.2.2: 提取静态系统指令到独立 extra，由 on_llm_request 追加到 system_prompt
+            # 🆕 v1.2.2-hotfix.1: 提取静态系统指令到独立 extra，由 on_llm_request 追加到 system_prompt
             # 注意: full_prompt 中保留原静态前缀以作安全网（钩子失败时仍可用）
             _reply_static_instructions = ReplyHandler.SYSTEM_REPLY_PROMPT
             if extra_prompt and extra_prompt.strip():

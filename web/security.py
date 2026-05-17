@@ -41,7 +41,9 @@ class BruteForceTracker:
 
     attempts: int = 0
     locked_until: float = 0.0
-    first_attempt: float = 0.0
+    last_attempt: float = 0.0
+    reached_max_tier: bool = False
+    rate_timestamps: list = None  # 懒初始化，避免可变默认值共享
 
 
 # 暴力破解阶梯延迟配置：(失败次数阈值, 锁定秒数)
@@ -50,6 +52,8 @@ _BRUTE_FORCE_TIERS = [
     (10, 60),
     (15, 300),
     (20, 600),
+    (30, 1800),
+    (50, 3600),
 ]
 
 # 访问日志文件最大大小（1MB）
@@ -140,6 +144,21 @@ class SecurityManager:
         # 暴力破解追踪 - 纯内存，重启清空
         self.brute_force: Dict[str, BruteForceTracker] = {}
 
+        # 暴力破解可配置参数（从配置文件读取）
+        self.brute_force_window: int = config.get("web_panel_brute_force_window", 3600)
+        self.brute_force_rate_window: int = config.get(
+            "web_panel_brute_force_rate_window", 10
+        )
+        self.brute_force_rate_count: int = config.get(
+            "web_panel_brute_force_rate_count", 3
+        )
+        self.brute_force_ban_duration: int = config.get(
+            "web_panel_brute_force_ban_duration", 0
+        )
+        self.brute_force_tiers: List[Tuple[int, int]] = self._parse_tiers(
+            config.get("web_panel_brute_force_tiers", "")
+        )
+
         # 启动时清理受保护 IP 误写入的封禁记录
         self._purge_protected_from_bans()
 
@@ -148,6 +167,42 @@ class SecurityManager:
     def _is_protected(self, ip: str) -> bool:
         """检查 IP 是否在受保护名单中"""
         return ip in self.protected_ips
+
+    @staticmethod
+    def _parse_tiers(raw_value) -> List[Tuple[int, int]]:
+        """从配置原始值解析阶梯列表，无效时回退到默认值。
+
+        Args:
+            raw_value: 可以是 str (JSON), list, 或其他无效值
+
+        Returns:
+            排序后的 [(count, seconds), ...] 列表
+        """
+        try:
+            if isinstance(raw_value, list) and all(
+                isinstance(t, (list, tuple)) and len(t) == 2 for t in raw_value
+            ):
+                parsed = [(int(t[0]), int(t[1])) for t in raw_value]
+                parsed.sort(key=lambda x: x[0])
+                if parsed:
+                    return parsed
+        except (ValueError, TypeError):
+            pass
+
+        try:
+            if isinstance(raw_value, str) and raw_value.strip():
+                parsed = json.loads(raw_value)
+                if isinstance(parsed, list) and all(
+                    isinstance(t, (list, tuple)) and len(t) == 2 for t in parsed
+                ):
+                    result = [(int(t[0]), int(t[1])) for t in parsed]
+                    result.sort(key=lambda x: x[0])
+                    if result:
+                        return result
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        return _BRUTE_FORCE_TIERS
 
     def _purge_protected_from_bans(self):
         """
@@ -586,32 +641,128 @@ class SecurityManager:
             return False, 0
 
         now = time.time()
+
+        # 窗口期衰减：超时无新失败则自动清零计数
+        if (
+            self.brute_force_window > 0
+            and (now - tracker.last_attempt) > self.brute_force_window
+        ):
+            self.brute_force.pop(ip, None)
+            return False, 0
+
         if tracker.locked_until > now:
             remaining = int(tracker.locked_until - now) + 1
             return True, remaining
 
         return False, 0
 
-    def record_login_failure(self, ip: str):
-        """记录一次登录失败"""
+    def record_login_failure(self, ip: str) -> dict:
+        """记录一次登录失败并返回操作详情。
+
+        Returns:
+            dict with keys: action, attempts, lock_seconds, banned
+                action: 'rate_ban' | 'permanent_ban' | 'tier_lock' | 'recorded'
+        """
         now = time.time()
         tracker = self.brute_force.get(ip)
+
         if tracker is None:
-            tracker = BruteForceTracker(attempts=0, locked_until=0.0, first_attempt=now)
+            tracker = BruteForceTracker(last_attempt=now)
+            tracker.rate_timestamps = []
             self.brute_force[ip] = tracker
 
         tracker.attempts += 1
+        tracker.last_attempt = now
 
+        max_threshold, max_seconds = self.brute_force_tiers[-1]
+
+        # 计算当前阶梯对应的锁定时长
         lock_seconds = 0
-        for threshold, seconds in _BRUTE_FORCE_TIERS:
+        for threshold, seconds in self.brute_force_tiers:
             if tracker.attempts >= threshold:
                 lock_seconds = seconds
 
+        # === 分支 1: 频率检测（速度限制，用于对抗脚本攻击）===
+        if self.brute_force_rate_window > 0 and self.brute_force_rate_count > 1:
+            cutoff = now - self.brute_force_rate_window
+            tracker.rate_timestamps = [
+                t for t in tracker.rate_timestamps if t >= cutoff
+            ]
+            tracker.rate_timestamps.append(now)
+            if len(tracker.rate_timestamps) >= self.brute_force_rate_count:
+                duration = self.brute_force_ban_duration
+                ban_duration = duration if duration > 0 else None
+                self.ban_ip(
+                    ip,
+                    reason=(
+                        f"[暴力破解] 频率异常（第{tracker.attempts}次，"
+                        f"{self.brute_force_rate_window}秒内失败{len(tracker.rate_timestamps)}次）"
+                    ),
+                    duration=ban_duration,
+                )
+                logger.warning(
+                    f"🔒 IP {ip} 登录频率异常，已封禁。"
+                    f"（第{tracker.attempts}次，"
+                    f"{self.brute_force_rate_window}秒内{len(tracker.rate_timestamps)}次失败）"
+                )
+                return {
+                    "action": "rate_ban",
+                    "attempts": tracker.attempts,
+                    "banned": True,
+                    "lock_seconds": 0,
+                    "rate_count": len(tracker.rate_timestamps),
+                    "rate_window": self.brute_force_rate_window,
+                }
+
+        # === 分支 2: 已达最大阶梯且锁已过期后再次尝试 → 封禁 ===
+        if tracker.attempts >= max_threshold:
+            tracker.reached_max_tier = True
+        if (
+            tracker.reached_max_tier
+            and tracker.locked_until <= now
+            and tracker.attempts > max_threshold
+        ):
+            duration = self.brute_force_ban_duration
+            ban_duration = duration if duration > 0 else None
+            self.ban_ip(
+                ip,
+                reason=(
+                    f"[暴力破解] 已达最大阶梯阈值（第{tracker.attempts}次），"
+                    f"解锁后继续尝试"
+                ),
+                duration=ban_duration,
+            )
+            logger.warning(
+                f"🔒 IP {ip} 登录失败次数已达最大阈值（{tracker.attempts}次），已封禁"
+            )
+            return {
+                "action": "permanent_ban",
+                "attempts": tracker.attempts,
+                "banned": True,
+                "lock_seconds": 0,
+            }
+
+        # === 分支 3: 阶梯锁定 ===
         if lock_seconds > 0:
             tracker.locked_until = now + lock_seconds
-            logger.warning(
-                f"🔒 IP {ip} 密码错误第 {tracker.attempts} 次，锁定 {lock_seconds} 秒"
-            )
+            if tracker.attempts >= 15:
+                logger.warning(
+                    f"🔒 IP {ip} 密码错误第 {tracker.attempts} 次，锁定 {lock_seconds} 秒"
+                )
+            return {
+                "action": "tier_lock",
+                "attempts": tracker.attempts,
+                "banned": False,
+                "lock_seconds": lock_seconds,
+            }
+
+        # === 分支 4: 仅记录，未锁定 ===
+        return {
+            "action": "recorded",
+            "attempts": tracker.attempts,
+            "banned": False,
+            "lock_seconds": 0,
+        }
 
     def reset_login_failures(self, ip: str):
         """登录成功后重置失败计数"""
@@ -622,11 +773,8 @@ class SecurityManager:
     def cleanup_stale_tracking_data(self, max_age_seconds: int = 3600):
         """清理超过指定时间无活动的请求追踪数据，释放内存。
 
-        仅清理 _request_timestamps 和 _authenticated_request_timestamps
-        （均为 60 秒滑动窗口，保留 1 小时已远超需求）。
-
-        brute_force 不清理 —— 它是累积计数的安全机制，
-        清空会让慢速暴力破解攻击者无限重试而不触发锁定。
+        包括滑动窗口计数器（60 秒窗口，清洗阈值 1 小时）和
+        暴力破解追踪器（按可配置窗口期清洗，最少保留 24 小时兜底）。
         """
         now = time.time()
         cutoff = now - max_age_seconds
@@ -655,6 +803,18 @@ class SecurityManager:
                 except KeyError:
                     pass
 
+        # 暴力破解追踪器清理：仅在用户启用窗口期衰减时生效
+        # 若用户关闭衰减（brute_force_window=0），则永远不清理，
+        # 保留原设计语义：防止慢速暴力破解攻击者利用清理重置计数。
+        if self.brute_force_window > 0:
+            bf_cutoff = now - max(self.brute_force_window, 86400)
+            for ip in list(self.brute_force.keys()):
+                tracker = self.brute_force.get(ip)
+                if tracker is None:
+                    continue
+                if tracker.locked_until <= now and tracker.last_attempt < bf_cutoff:
+                    del self.brute_force[ip]
+
     # ==================== 配置更新 ====================
 
     def update_config(self, config: dict):
@@ -671,6 +831,19 @@ class SecurityManager:
         self.authenticated_rate_limit = config.get(
             "web_panel_authenticated_rate_limit",
             max(_DEFAULT_AUTHENTICATED_RATE_LIMIT, self.anti_spider_rate_limit * 4),
+        )
+
+        # 暴力破解可配置参数
+        self.brute_force_window = config.get("web_panel_brute_force_window", 3600)
+        self.brute_force_rate_window = config.get(
+            "web_panel_brute_force_rate_window", 10
+        )
+        self.brute_force_rate_count = config.get("web_panel_brute_force_rate_count", 3)
+        self.brute_force_ban_duration = config.get(
+            "web_panel_brute_force_ban_duration", 0
+        )
+        self.brute_force_tiers = self._parse_tiers(
+            config.get("web_panel_brute_force_tiers", "")
         )
 
         # 若受保护 IP 名单发生变化，重新检查封禁表

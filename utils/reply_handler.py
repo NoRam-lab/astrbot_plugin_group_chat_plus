@@ -3,7 +3,7 @@
 负责调用AI生成回复
 
 作者: Him666233
-版本: v1.2.2
+版本: v1.2.2-hotfix.1
 
 v1.2.0 更新：
 - 改用 event.request_llm() 替代 provider.text_chat()，支持其他插件的钩子注入
@@ -40,7 +40,7 @@ PLUGIN_ENABLE_TOOLS_REMINDER = "_group_chat_plus_enable_tools_reminder"
 PLUGIN_TOOLS_REMINDER_PERSONA_FILTER = "_group_chat_plus_tools_reminder_persona_filter"
 # 🔧 存储工具提醒的人格白名单（可选），用于避免 on_llm_request 重复查询
 PLUGIN_ALLOWED_TOOL_NAMES = "_group_chat_plus_allowed_tool_names"
-# 🆕 v1.2.2: 存储插件静态系统指令，由 on_llm_request 追加到 system_prompt 末尾，
+# 🆕 v1.2.2-hotfix.1: 存储插件静态系统指令，由 on_llm_request 追加到 system_prompt 末尾，
 # 提高 system prompt 缓存命中率（整块缓存，不依赖前缀匹配）
 PLUGIN_CUSTOM_STATIC_INSTRUCTIONS = "_group_chat_plus_static_instructions"
 
@@ -202,7 +202,7 @@ class ReplyHandler:
         if history_messages is None:
             history_messages = []
 
-        # 🔧 v1.2.2: 不再构建 contexts 数组，改为全部依赖 full_prompt 文本传递历史上下文。
+        # 🔧 v1.2.2-hotfix.1: 不再构建 contexts 数组，改为全部依赖 full_prompt 文本传递历史上下文。
         # 原因：群聊中所有非 bot 消息都被标为 role="user"，LLM 在结构层面无法区分
         # 不同用户的发言，导致消息密集时 AI 混淆发送者身份。
         # full_prompt（由 format_context_for_ai() 生成）已包含完整历史且每条消息
@@ -304,7 +304,7 @@ class ReplyHandler:
             # 这样AI服务商的前缀缓存（prefix caching）可以命中静态部分，降低调用成本。
             if prompt_mode == "override" and extra_prompt and extra_prompt.strip():
                 # 覆盖模式：用户自定义提示词在前（静态），动态内容在后
-                # 🔧 v1.2.2: sender_emphasis 提前到 formatted_message 之前，
+                # 🔧 v1.2.2-hotfix.1: sender_emphasis 提前到 formatted_message 之前，
                 # 让 AI 在阅读历史消息前就明确当前对话对象，避免被历史/窗口缓冲消息干扰
                 full_prompt = (
                     extra_prompt.strip()
@@ -340,7 +340,7 @@ class ReplyHandler:
                 full_prompt += ReplyHandler.SYSTEM_REPLY_PROMPT_ENDING
 
                 # 动态内容放在最后
-                # 🔧 v1.2.2: sender_emphasis 提前到 formatted_message 之前
+                # 🔧 v1.2.2-hotfix.1: sender_emphasis 提前到 formatted_message 之前
                 full_prompt += (
                     sender_emphasis
                     + "\n"
@@ -427,7 +427,7 @@ class ReplyHandler:
                 logger.warning(f"获取人格设定失败: {e}，使用空人格")
 
             # 如果有begin_dialogs，将其追加到prompt末尾（不破坏静态前缀缓存）
-            # 🔧 v1.2.2: 从 prompt 开头移到末尾，使 SYSTEM_REPLY_PROMPT（静态指令）
+            # 🔧 v1.2.2-hotfix.1: 从 prompt 开头移到末尾，使 SYSTEM_REPLY_PROMPT（静态指令）
             # 保持在 prompt 最前面，提高前缀缓存命中概率
             if begin_dialogs_text:
                 full_prompt += begin_dialogs_text
@@ -450,7 +450,7 @@ class ReplyHandler:
             event.set_extra(PLUGIN_CUSTOM_SYSTEM_PROMPT, system_prompt)
             # 存储插件自定义的完整 prompt（含历史上下文），供 on_llm_request 钩子恢复使用
             event.set_extra(PLUGIN_CUSTOM_PROMPT, full_prompt)
-            # 🆕 v1.2.2: 提取静态系统指令到独立 extra，由 on_llm_request 追加到 system_prompt
+            # 🆕 v1.2.2-hotfix.1: 提取静态系统指令到独立 extra，由 on_llm_request 追加到 system_prompt
             # 注意: full_prompt 中保留原静态前缀以作安全网（钩子失败时仍可用）
             _reply_static_instructions = ReplyHandler.SYSTEM_REPLY_PROMPT
             if extra_prompt and extra_prompt.strip():

@@ -10,7 +10,7 @@
 6. 失败处理和冷却机制
 
 作者: Him666233
-版本: v1.2.2
+版本: v1.2.2-hotfix.1
 
 v1.2.0 更新：
 - 支持其他插件的 on_llm_request 钩子注入（如 emotionai）
@@ -48,7 +48,7 @@ PLUGIN_CUSTOM_PROMPT = "_group_chat_plus_prompt"
 PLUGIN_IMAGE_URLS = "_group_chat_plus_image_urls"
 PLUGIN_FUNC_TOOL = "_group_chat_plus_func_tool"
 PLUGIN_CURRENT_MESSAGE = "_group_chat_plus_current_message"
-# 🆕 v1.2.2: 存储插件静态系统指令，由 on_llm_request 追加到 system_prompt 末尾
+# 🆕 v1.2.2-hotfix.1: 存储插件静态系统指令，由 on_llm_request 追加到 system_prompt 末尾
 PLUGIN_CUSTOM_STATIC_INSTRUCTIONS = "_group_chat_plus_static_instructions"
 
 
@@ -125,7 +125,7 @@ class ProactiveChatManager:
     _proactive_failure_threshold_perturbation: float = 0.0
     _proactive_failure_sequence_probability: float = -1.0
     _proactive_normal_reply_cooldown: int = (
-        60  # 🆕 v1.2.2: 普通对话后的主动对话冷静期（秒）
+        60  # 🆕 v1.2.2-hotfix.1: 普通对话后的主动对话冷静期（秒）
     )
     _proactive_require_user_activity: bool = True
     _proactive_min_user_messages: int = 3
@@ -286,7 +286,7 @@ class ProactiveChatManager:
         ]
         cls._proactive_normal_reply_cooldown = config.get(
             "proactive_normal_reply_cooldown", 60
-        )  # 🆕 v1.2.2: 普通对话后的主动对话冷静期
+        )  # 🆕 v1.2.2-hotfix.1: 普通对话后的主动对话冷静期
         cls._proactive_require_user_activity = config["proactive_require_user_activity"]
         cls._proactive_min_user_messages = config["proactive_min_user_messages"]
         cls._proactive_probability = config["proactive_probability"]
@@ -1072,7 +1072,7 @@ class ProactiveChatManager:
             "last_complaint_decay_time": time.time(),  # 上次吐槽衰减检查时间
             # 🆕 扰动因子相关字段（在开始新一轮连续尝试时计算一次）
             "current_effective_max_failures": -1,  # 当前轮次的有效最大失败阈值（-1表示未设置，使用配置值）
-            # 🆕 v1.2.2: 普通对话时间追踪
+            # 🆕 v1.2.2-hotfix.1: 普通对话时间追踪
             "last_normal_reply_time": 0,  # 上次普通对话（非主动）回复时间（用于冷静期和吐槽感知）
         }
 
@@ -1178,7 +1178,7 @@ class ProactiveChatManager:
                         )
                     state["proactive_active"] = False
                     # 注意：不设置 outcome_recorded，因为这不是一个判定，只是关闭
-                # 🆕 v1.2.2: 记录普通对话回复时间（用于冷静期和吐槽感知）
+                # 🆕 v1.2.2-hotfix.1: 记录普通对话回复时间（用于冷静期和吐槽感知）
                 state["last_normal_reply_time"] = current_time
                 if cls._debug_mode:
                     logger.info(
@@ -2049,7 +2049,7 @@ class ProactiveChatManager:
         # 🔧 修复：使用累积失败次数而不是连续失败次数
         total_failures = state.get("total_proactive_failures", 0)
 
-        # 🆕 v1.2.2: 感知普通对话活跃度
+        # 🆕 v1.2.2-hotfix.1: 感知普通对话活跃度
         # 若近10分钟内有普通对话回复，说明群里并不冷清，应调整吐槽概率和文案
         _normal_recent_threshold = 600  # 10分钟
         _last_normal_reply_time = state.get("last_normal_reply_time", 0)
@@ -2076,7 +2076,7 @@ class ProactiveChatManager:
         if total_failures >= strong_threshold:
             # 强烈吐槽
             complaint_prob = cls._complaint_probability_strong
-            # 🆕 v1.2.2: 群里普通对话活跃时降低概率（群没冷清，只是没理主动话）
+            # 🆕 v1.2.2-hotfix.1: 群里普通对话活跃时降低概率（群没冷清，只是没理主动话）
             if group_is_actively_chatting:
                 complaint_prob *= 0.7
             roll = random.random()
@@ -2085,7 +2085,7 @@ class ProactiveChatManager:
             ):  # 🔧 修复：roll > prob 表示不触发，roll <= prob 表示触发
                 default_result["failure_count"] = total_failures
                 return default_result
-            # 🆕 v1.2.2: 根据群活跃状态切换文案
+            # 🆕 v1.2.2-hotfix.1: 根据群活跃状态切换文案
             if group_is_actively_chatting:
                 strong_prompt = (
                     "\n\n【情绪提示】你已经主动说了{0}次话都没人回你，但群里其实还有人在聊别的。"
@@ -2110,7 +2110,7 @@ class ProactiveChatManager:
         elif total_failures >= medium_threshold:
             # 明显吐槽
             complaint_prob = cls._complaint_probability_medium
-            # 🆕 v1.2.2: 群里普通对话活跃时降低概率
+            # 🆕 v1.2.2-hotfix.1: 群里普通对话活跃时降低概率
             if group_is_actively_chatting:
                 complaint_prob *= 0.5
             roll = random.random()
@@ -2119,7 +2119,7 @@ class ProactiveChatManager:
             ):  # 🔧 修复：roll > prob 表示不触发，roll <= prob 表示触发
                 default_result["failure_count"] = total_failures
                 return default_result
-            # 🆕 v1.2.2: 根据群活跃状态切换文案
+            # 🆕 v1.2.2-hotfix.1: 根据群活跃状态切换文案
             if group_is_actively_chatting:
                 medium_prompt = (
                     "\n\n【情绪提示】你已经主动说了{0}次话了，但没有人回你——不过群里有人在聊天。"
@@ -2143,7 +2143,7 @@ class ProactiveChatManager:
         elif total_failures >= light_threshold:
             # 轻度吐槽
             complaint_prob = cls._complaint_probability_light
-            # 🆕 v1.2.2: 群里普通对话活跃时降低概率
+            # 🆕 v1.2.2-hotfix.1: 群里普通对话活跃时降低概率
             if group_is_actively_chatting:
                 complaint_prob *= 0.5
             roll = random.random()
@@ -2152,7 +2152,7 @@ class ProactiveChatManager:
             ):  # 🔧 修复：roll > prob 表示不触发，roll <= prob 表示触发
                 default_result["failure_count"] = total_failures
                 return default_result
-            # 🆕 v1.2.2: 根据群活跃状态切换文案
+            # 🆕 v1.2.2-hotfix.1: 根据群活跃状态切换文案
             if group_is_actively_chatting:
                 light_prompt = (
                     "\n\n【情绪提示】你刚才主动说了一句话，但似乎没什么人回应——不过群里其实有人在聊。"
@@ -2333,7 +2333,7 @@ class ProactiveChatManager:
             remaining = int(state["cooldown_until"] - current_time)
             return False, f"在冷却期（剩余{remaining}秒）"
 
-        # 🆕 v1.2.2: 普通对话冷静期检查
+        # 🆕 v1.2.2-hotfix.1: 普通对话冷静期检查
         # 若AI刚刚通过普通对话流程回复了群里，则跳过本次主动对话触发
         # 避免「刚回完消息又主动发言」的奇怪体验
         _normal_reply_cooldown = cls._proactive_normal_reply_cooldown
@@ -4683,7 +4683,7 @@ class ProactiveChatManager:
                 logger.warning(f"[主动对话-人格获取] 获取失败: {e}，使用空人格")
 
             # 如果有begin_dialogs，将其追加到prompt末尾（不破坏静态前缀缓存）
-            # 🔧 v1.2.2: 静态指令不再拼接在 final_message 中，改为存储到 extra
+            # 🔧 v1.2.2-hotfix.1: 静态指令不再拼接在 final_message 中，改为存储到 extra
             # （由 on_llm_request 追加到 system_prompt）
             if begin_dialogs_text:
                 final_message += begin_dialogs_text
@@ -4730,7 +4730,7 @@ class ProactiveChatManager:
                     #    main.py 的 on_llm_request 钩子（priority=-1）会把
                     #    req.prompt 换回 final_message 供 AI 推理使用。
                     virtual_event.set_extra(PLUGIN_CURRENT_MESSAGE, "")
-                    # 🆕 v1.2.2: 静态指令通过 extra 传递，由 on_llm_request 追加到 system_prompt
+                    # 🆕 v1.2.2-hotfix.1: 静态指令通过 extra 传递，由 on_llm_request 追加到 system_prompt
                     _proactive_static_instructions = (
                         "\n\n[系统指令-历史上下文识别]\n"
                         "- 标有「【禁止重复-你的历史回复】」的是你之前说过的话，不要重复相同句式或观点\n"

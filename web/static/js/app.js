@@ -160,6 +160,13 @@ const App = {
 
         // 初始化默认视图
         await this._activateView(this._currentView);
+
+        // 全局点击：工具提示外部点击时关闭（移动端）
+        document.addEventListener('click', (e) => {
+            if (this._logTooltip && !e.target.closest('[data-tooltip]')) {
+                this._hideLogTooltip();
+            }
+        });
     },
 
     // ===================== 指令执行视图 =====================
@@ -470,10 +477,10 @@ const App = {
                 if (log.note) {
                     const safeNote = Utils.escapeHtml(log.note);
                     noteHtml = log.note.includes('[防爬虫自动封禁]')
-                        ? `<span class="status-badge status-warn log-card-note-full" title="${safeNote}">🕷️ ${safeNote}</span>`
+                        ? `<span class="status-badge status-warn log-card-note-full" data-tooltip="${safeNote}">🕷️ ${safeNote}</span>`
                         : log.note.includes('登录失败')
-                            ? `<span class="status-badge status-warn log-card-note-full" title="${safeNote}">🔑 ${safeNote}</span>`
-                            : `<span class="log-card-note-full" title="${safeNote}">${safeNote}</span>`;
+                            ? `<span class="status-badge status-warn log-card-note-full" data-tooltip="${safeNote}">🔑 ${safeNote}</span>`
+                            : `<span class="log-card-note-full" data-tooltip="${safeNote}">${safeNote}</span>`;
                 }
                 const card = document.createElement('div');
                 card.className = 'log-card';
@@ -512,16 +519,16 @@ const App = {
                         ? Utils.escapeHtml(log.note.slice(0, 80)) + '…'
                         : safeNote;
                     if (log.note.includes('[防爬虫自动封禁]')) {
-                        noteHtml = `<span class="log-note-spider" title="${safeNote}"
+                        noteHtml = `<span class="log-note-spider" data-tooltip="${safeNote}"
                             style="font-size:11px;background:rgba(224,32,32,0.15);color:var(--accent-red);
                             border:1px solid rgba(224,32,32,0.35);border-radius:3px;padding:2px 6px;
                             white-space:nowrap;display:inline-block;">
                             🕷️ ${displayText}
                         </span>`;
                     } else if (log.note.includes('登录失败')) {
-                        noteHtml = `<span class="log-note-brute" title="${safeNote}">🔑 ${displayText}</span>`;
+                        noteHtml = `<span class="log-note-brute" data-tooltip="${safeNote}">🔑 ${displayText}</span>`;
                     } else {
-                        noteHtml = `<span class="log-note" title="${safeNote}">${displayText}</span>`;
+                        noteHtml = `<span class="log-note" data-tooltip="${safeNote}">${displayText}</span>`;
                     }
                 }
 
@@ -546,6 +553,8 @@ const App = {
                 this._showBanDialog(btn.dataset.banIp, logEntry);
             });
         });
+
+        this._bindLogTooltips(container);
 
         this._renderPagination(total, this._accessLogPage);
     },
@@ -589,6 +598,75 @@ const App = {
             actions.appendChild(next);
         }
         container.appendChild(actions);
+    },
+
+    /** 为访问日志附注元素绑定自定义工具提示事件 */
+    _bindLogTooltips(container) {
+        const notes = container.querySelectorAll('[data-tooltip]');
+        notes.forEach(el => {
+            el.addEventListener('mouseenter', (e) => {
+                this._showLogTooltip(e, el.dataset.tooltip);
+            });
+            el.addEventListener('mouseleave', () => {
+                this._hideLogTooltip();
+            });
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this._toggleLogTooltip(e, el.dataset.tooltip);
+            });
+        });
+    },
+
+    /** 在光标附近显示工具提示 */
+    _showLogTooltip(event, text) {
+        this._hideLogTooltip();
+        const tip = document.createElement('div');
+        tip.className = 'log-tooltip';
+        tip.textContent = text;
+        document.body.appendChild(tip);
+        // 强制重排后添加 show 类以触发过渡动画
+        void tip.offsetWidth;
+        tip.classList.add('show');
+        this._logTooltip = tip;
+        this._positionLogTooltip(event);
+    },
+
+    /** 定位工具提示，确保不超出视口 */
+    _positionLogTooltip(event) {
+        if (!this._logTooltip) return;
+        const tip = this._logTooltip;
+        const rect = tip.getBoundingClientRect();
+        let left = event.clientX + 14;
+        let top = event.clientY + 14;
+        if (left + rect.width > window.innerWidth - 10) {
+            left = window.innerWidth - rect.width - 10;
+        }
+        if (top + rect.height > window.innerHeight - 10) {
+            top = window.innerHeight - rect.height - 10;
+        }
+        if (left < 10) left = 10;
+        if (top < 10) top = 10;
+        tip.style.left = left + 'px';
+        tip.style.top = top + 'px';
+    },
+
+    /** 隐藏并移除工具提示 */
+    _hideLogTooltip() {
+        if (this._logTooltip) {
+            this._logTooltip.classList.remove('show');
+            const tip = this._logTooltip;
+            this._logTooltip = null;
+            setTimeout(() => { if (tip.parentNode) tip.remove(); }, 160);
+        }
+    },
+
+    /** 切换工具提示（移动端点击行为） */
+    _toggleLogTooltip(event, text) {
+        if (this._logTooltip && this._logTooltip.classList.contains('show')) {
+            this._hideLogTooltip();
+        } else {
+            this._showLogTooltip(event, text);
+        }
     },
 
     /** 显示封禁 IP 弹窗，entry 为可选的访问日志条目（用于预填原因） */
@@ -1006,6 +1084,11 @@ const App = {
             'web_panel_heartbeat_hidden_interval_seconds',
             'web_panel_heartbeat_retry_base_seconds',
             'web_panel_heartbeat_retry_max_seconds',
+            'web_panel_brute_force_window',
+            'web_panel_brute_force_rate_window',
+            'web_panel_brute_force_rate_count',
+            'web_panel_brute_force_tiers',
+            'web_panel_brute_force_ban_duration',
         ];
 
         readonlyKeys.forEach(key => {

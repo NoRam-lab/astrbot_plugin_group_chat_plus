@@ -4,7 +4,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-v1.2.2-blue.svg)](https://github.com/Him666233/astrbot_plugin_group_chat_plus)
+[![Version](https://img.shields.io/badge/version-v1.2.2-hotfix.1-blue.svg)](https://github.com/Him666233/astrbot_plugin_group_chat_plus)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%E2%89%A5v4.11.0-green.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-orange.svg)](LICENSE)
 
@@ -67,7 +67,7 @@
 
 > **强烈建议启用 Web 端功能** — Web 管理面板提供了可视化配置编辑、实时统计、会话管理等完善的插件管理体验，比传统 JSON 配置界面更加直观易用。
 
-> **⚠️ 从旧版本升级的用户请务必注意**：v1.2.2 版本对 Web 面板安全机制进行了全面升级（Argon2id 密码哈希、JWT + HttpOnly Cookie + 服务端会话表等），**请尽快登录一次 Web 面板，让旧版密码自动透明升级为更强的 Argon2id 哈希，同时堵住各项安全漏洞**，确保您的面板安全。
+> **⚠️ 从旧版本升级的用户请务必注意**：v1.2.2-hotfix.1 版本对 Web 面板安全机制进行了全面升级（Argon2id 密码哈希、JWT + HttpOnly Cookie + 服务端会话表等），**请尽快登录一次 Web 面板，让旧版密码自动透明升级为更强的 Argon2id 哈希，同时堵住各项安全漏洞**，确保您的面板安全。
 
 ### 关于配置文件：为什么能下载但不能上传？
 
@@ -158,7 +158,7 @@
 
 ---
 
-## 🆕 v1.2.2 更新亮点
+## 🆕 v1.2.2-hotfix.1 更新亮点
 
 **本次更新带来了全新的 Smart 并发模式、注意力冷却重构、System Prompt 兼容增强、Web 面板安全全面加固，以及多项消息处理链路重构与判断型 AI 增强。**
 
@@ -196,7 +196,7 @@
 - **安全响应头全面配置** — 所有页面统一注入安全响应头：`X-Content-Type-Options: nosniff`（禁止 MIME 类型嗅探）/ `X-Frame-Options: DENY`（禁止页面被嵌入 frame，防点击劫持）/ `X-XSS-Protection: 1; mode=block`（启用浏览器 XSS 过滤器）/ `Referrer-Policy: no-referrer`（不泄露 Referrer）/ `Permissions-Policy: geolocation=(), microphone=(), camera=()`（禁用敏感硬件 API），全方位防止各类注入攻击
 - **Nonce-based 严格 CSP** — Content-Security-Policy 使用每次请求唯一的 Base64 nonce（`secrets.token_urlsafe(24)`），三套独立 CSP 模板分别服务于登录页、面板页和错误/拦截页。script-src 不再依赖 `unsafe-inline`，内联脚本通过 nonce 匹配验证，外部脚本由 `'self'` 放行（同样不经 nonce），从源头阻断 XSS 代码注入
 - **防爬虫与速率限制** — 可疑 UA 模式（bot/crawler/spider/scanner 等）自动检测与封禁，扫描路径探测（.php/.asp/.env/.git/wp-admin/.DS_Store 等常见漏洞扫描路径）自动拦截返回错误页，1 分钟滑动窗口速率限制（认证前 `/api/auth/login` 独立限频、认证后其他 API 独立限频，均为 1 分钟滑动窗口），`/robots.txt` 显式禁止所有爬虫收录
-- **暴力破解分级锁定** — 登录失败递增锁定：5 次 → 30s / 10 次 → 60s / 15 次 → 300s / 20 次 → 600s；受保护 IP（`web_panel_protected_ips`）永不被封禁
+- **暴力破解分级锁定** — 登录失败递增锁定：5 次 → 30s / 10 次 → 60s / 15 次 → 300s / 20 次 → 600s / 30 次 → 1800s / 50 次 → 3600s；频率检测（短时间多次失败直接封禁）；窗口期超时自动重置失败计数；达到最大阶梯解锁后再次尝试自动永久封禁（以上所有参数均可配置）。受保护 IP（`web_panel_protected_ips`）永不被封禁
 - **IP 访问控制** — 支持白名单/黑名单模式（`web_panel_ip_mode`：`whitelist` 仅允许白名单 IP / `blacklist` 禁止黑名单 IP），白名单 IP 绕过爬虫检测与封禁检查。反向代理部署在同机时自动读取 `X-Real-IP` / `X-Forwarded-For` 头获取真实客户端 IP（环回地址自动信任）；反向代理不在本机时需显式开启 `web_panel_trust_proxy` 才会信任代理头
 - **心跳保活机制** — 前端定时心跳请求（`POST /api/auth/heartbeat`）维持会话活性。可见标签页和隐藏标签页使用独立可配置的心跳间隔（`web_panel_heartbeat_visible_interval_seconds` / `web_panel_heartbeat_hidden_interval_seconds`），心跳失败时采用指数退避重试策略（`web_panel_heartbeat_retry_base_seconds` → `web_panel_heartbeat_retry_max_seconds`）。心跳请求不触发认证速率限制，但正常更新服务端会话的 `last_heartbeat_at` 活跃时间戳；若 JWT 令牌过期（24 小时绝对有效期）或密码/令牌版本变更，下一次心跳直接返回 401 由前端统一处理重新登录
 - **认证文件物理隔离** — auth.json 与 jwt_secret.json 分离存储，旧版混合文件启动时自动分离
@@ -1117,7 +1117,7 @@ AI 一次性感知 A + 追加消息B → 生成统一回复
 - 进入 GWW 的消息不会再进入 Smart 批处理流程
 - 窗口追加消息区域会复用 GWW 的展示增强逻辑：基础 `@` 解析会展开为 `[At:ID|解析结果]`，`@全体` 会补充说明，持久化戳一戳事件文本也会显示给 AI；但主消息专用的 `[系统提示]` / `【@指向说明】` 不会直接塞进追加消息区
 
-### 等待窗口令牌绑定与回落机制（v1.2.2+）
+### 等待窗口令牌绑定与回落机制（v1.2.2-hotfix.1+）
 
 每个等待窗口创建时分配唯一递增令牌，窗口期内被拦截的消息携带该令牌写入缓存（`window_buffered=True`）。**当读空气AI判定"不回复"时**，系统自动将当前窗口批次的所有缓冲消息转为普通缓存（移除标记），具备三层隔离：
 
@@ -1212,9 +1212,9 @@ AI 一次性感知 A + 追加消息B → 生成统一回复
 
 ## 📝 更新日志
 
-### v1.2.2 (2026-05-17)
+### v1.2.2-hotfix.1 (2026-05-18)
 
-**Smart 并发模式 + 注意力冷却重构 + System Prompt 兼容增强 + Web 面板安全全面加固 + 消息处理链路重构 + 判断型 AI 增强**
+**Smart 并发模式 + 注意力冷却重构 + System Prompt 兼容增强 + Web 面板安全全面加固（含暴力破解防护升级）+ 消息处理链路重构 + 判断型 AI 增强**
 
 **🔄 Smart 并发模式**:
 - **消息批次智能合并** — 同群多条消息按真实到达顺序注册，最早到达的担任主消息(anchor)，在读空气 AI 前吸收已准备好的后续消息，支持多用户批处理
@@ -1246,7 +1246,7 @@ AI 一次性感知 A + 追加消息B → 生成统一回复
 - **安全响应头全面配置** — 所有页面统一注入安全响应头：`X-Content-Type-Options: nosniff`（禁止 MIME 类型嗅探）/ `X-Frame-Options: DENY`（禁止页面被嵌入 frame，防点击劫持）/ `X-XSS-Protection: 1; mode=block`（启用浏览器 XSS 过滤器）/ `Referrer-Policy: no-referrer`（不泄露 Referrer）/ `Permissions-Policy: geolocation=(), microphone=(), camera=()`（禁用敏感硬件 API），全方位防止各类注入攻击
 - **Nonce-based 严格 CSP** — Content-Security-Policy 使用每次请求唯一的 Base64 nonce（`secrets.token_urlsafe(24)`），三套独立 CSP 模板分别服务于登录页、面板页和错误/拦截页。script-src 不再依赖 `unsafe-inline`，内联脚本通过 nonce 匹配验证，外部脚本由 `'self'` 放行（同样不经 nonce），从源头阻断 XSS 代码注入
 - **防爬虫与速率限制** — 可疑 UA 模式（bot/crawler/spider/scanner 等）自动检测与封禁，扫描路径探测（.php/.asp/.env/.git/wp-admin/.DS_Store 等常见漏洞扫描路径）自动拦截返回错误页，1 分钟滑动窗口速率限制（认证前 `/api/auth/login` 独立限频、认证后其他 API 独立限频，均为 1 分钟滑动窗口），`/robots.txt` 显式禁止所有爬虫收录
-- **暴力破解分级锁定** — 登录失败递增锁定：5 次 → 30s / 10 次 → 60s / 15 次 → 300s / 20 次 → 600s；受保护 IP（`web_panel_protected_ips`）永不被封禁
+- **暴力破解分级锁定** — 登录失败递增锁定：5 次 → 30s / 10 次 → 60s / 15 次 → 300s / 20 次 → 600s / 30 次 → 1800s / 50 次 → 3600s；频率检测（短时间多次失败直接封禁）；窗口期超时自动重置失败计数；达到最大阶梯解锁后再次尝试自动永久封禁（以上所有参数均可配置）。受保护 IP（`web_panel_protected_ips`）永不被封禁
 - **IP 访问控制** — 支持白名单/黑名单模式（`web_panel_ip_mode`：`whitelist` 仅允许白名单 IP / `blacklist` 禁止黑名单 IP），白名单 IP 绕过爬虫检测与封禁检查。反向代理部署在同机时自动读取 `X-Real-IP` / `X-Forwarded-For` 头获取真实客户端 IP（环回地址自动信任）；反向代理不在本机时需显式开启 `web_panel_trust_proxy` 才会信任代理头
 - **心跳保活机制** — 前端定时心跳请求（`POST /api/auth/heartbeat`）维持会话活性。可见标签页和隐藏标签页使用独立可配置的心跳间隔（`web_panel_heartbeat_visible_interval_seconds` / `web_panel_heartbeat_hidden_interval_seconds`），心跳失败时采用指数退避重试策略（`web_panel_heartbeat_retry_base_seconds` → `web_panel_heartbeat_retry_max_seconds`）。心跳请求不触发认证速率限制，但正常更新服务端会话的 `last_heartbeat_at` 活跃时间戳；若 JWT 令牌过期（24 小时绝对有效期）或密码/令牌版本变更，下一次心跳直接返回 401 由前端统一处理重新登录
 - **认证文件物理隔离** — auth.json 与 jwt_secret.json 分离存储，旧版混合文件启动时自动分离
@@ -1347,7 +1347,7 @@ AI 一次性感知 A + 追加消息B → 生成统一回复
 - `web/static/css/tech-tree.css` — 搜索框样式、搜索结果面板、移动端抽屉式面板
 - `main.py` — 集成所有新模块，新增 40+ 配置项读取，冷群转正调度，消息链路重构
 - `_conf_schema.json` — 新增 40+ 配置项（Smart 并发、注意力冷却、判断型 AI 推理、冷群转正、桌面端检测、Web 面板安全等）
-- `metadata.yaml` — 更新版本号到 v1.2.2
+- `metadata.yaml` — 更新版本号到 v1.2.2-hotfix.1
 - `docs/DESKTOP_COMPATIBILITY.md` — **新增** 桌面端兼容说明文档
 - `private_chat/` — 私聊模块同步安全加固与兼容修复
 

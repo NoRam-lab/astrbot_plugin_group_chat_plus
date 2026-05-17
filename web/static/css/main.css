@@ -454,6 +454,38 @@ body.config-panel-open .config-file-badge {
     color: var(--text-muted);
 }
 
+/* ===== 访问日志自定义工具提示 ===== */
+.log-tooltip {
+    position: fixed;
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    max-width: 380px;
+    word-break: break-all;
+    pointer-events: none;
+    z-index: 2000;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-primary);
+    box-shadow: var(--glass-shadow);
+    opacity: 0;
+    transform: translateY(4px);
+    transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.log-tooltip.show {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+/* 附注元素可点击/悬停以触发工具提示 */
+.log-note,
+.log-note-brute,
+.log-note-spider,
+.log-card-note-full {
+    cursor: pointer;
+}
+
 .log-card-list {
     display: flex;
     flex-direction: column;

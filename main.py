@@ -32,7 +32,7 @@
 - @消息会跳过所有判断直接回复
 
 作者: Him666233
-版本: v1.2.2
+版本: v1.2.2-hotfix.1
 
 v1.2.1 更新内容：
 - 🆕 Web管理面板 - 全新可视化管理界面，支持JWT认证、访问日志、统计图表、IP安全管理
@@ -137,8 +137,8 @@ from .utils import (
     WelcomeMessageParser,  # 🆕 新成员入群消息解析器
     ReplyDensityManager,  # 🆕 v1.2.1: 回复密度管理器
     MessageQualityScorer,  # 🆕 v1.2.1: 消息质量预判器
-    SmartConcurrentManager,  # 🆕 v1.2.2: 智能并发合并管理器
-    SystemPromptRewriter,  # 🆕 v1.2.2: system_prompt 重写增强
+    SmartConcurrentManager,  # 🆕 v1.2.2-hotfix.1: 智能并发合并管理器
+    SystemPromptRewriter,  # 🆕 v1.2.2-hotfix.1: system_prompt 重写增强
 )
 from .utils.image_description_cache import (
     ImageDescriptionCache,
@@ -152,7 +152,7 @@ from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
     "astrbot_plugin_group_chat_plus",
     "Him666233",
     "一个以AI读空气为主的群聊聊天效果增强插件",
-    "v1.2.2",
+    "v1.2.2-hotfix.1",
     "https://github.com/Him666233/astrbot_plugin_group_chat_plus",
 )
 class ChatPlus(Star):
@@ -1642,7 +1642,7 @@ class ChatPlus(Star):
         )  # 临时提升持续时间
         self.proactive_normal_reply_cooldown = config.get(
             "proactive_normal_reply_cooldown", 60
-        )  # 🆕 v1.2.2: 普通对话回复后主动对话冷静期（秒），0=禁用
+        )  # 🆕 v1.2.2-hotfix.1: 普通对话回复后主动对话冷静期（秒），0=禁用
         self.proactive_enable_quiet_time = config.get(
             "proactive_enable_quiet_time", False
         )  # 启用禁用时段
@@ -1863,13 +1863,13 @@ class ChatPlus(Star):
         )  # 并发等待间隔
         self.concurrent_mode = config.get(
             "concurrent_mode", "legacy"
-        )  # 🆕 v1.2.2: 并发处理模式（legacy=传统等待, smart=智能合并）
+        )  # 🆕 v1.2.2-hotfix.1: 并发处理模式（legacy=传统等待, smart=智能合并）
         self.enable_smart_batch_reply_hint = config.get(
             "enable_smart_batch_reply_hint", True
         )  # 🆕 Smart模式批次回复提示增强开关
         self.smart_concurrent_merge_wait = config.get(
             "smart_concurrent_merge_wait", 30.0
-        )  # 🆕 v1.2.2: Smart模式合并超时时间（秒）
+        )  # 🆕 v1.2.2-hotfix.1: Smart模式合并超时时间（秒）
         self.typing_delay_timeout_warning = config.get(
             "typing_delay_timeout_warning", 5
         )  # 打字延迟超时警告
@@ -2420,7 +2420,7 @@ class ChatPlus(Star):
 
         # ========== 日志输出 ==========
         logger.info("=" * 50)
-        logger.info("群聊增强插件已加载 - v1.2.2")
+        logger.info("群聊增强插件已加载 - v1.2.2-hotfix.1")
         logger.info(
             f"🔘 群聊功能总开关: {'✓ 已启用' if self.enable_group_chat else '✗ 已禁用'}"
         )
@@ -2731,7 +2731,7 @@ class ChatPlus(Star):
             "proactive_check_interval": self.proactive_check_interval,
             "proactive_temp_boost_probability": self.proactive_temp_boost_probability,
             "proactive_temp_boost_duration": self.proactive_temp_boost_duration,
-            "proactive_normal_reply_cooldown": self.proactive_normal_reply_cooldown,  # 🆕 v1.2.2
+            "proactive_normal_reply_cooldown": self.proactive_normal_reply_cooldown,  # 🆕 v1.2.2-hotfix.1
             # 提示词配置
             "proactive_prompt": self.proactive_prompt,
             "proactive_retry_prompt": self.proactive_retry_prompt,
@@ -2940,7 +2940,7 @@ class ChatPlus(Star):
         # 生成运行时签名，用于追踪插件实例状态
         self._session_sig = self._compute_session_integrity("init")
         self._emit_session_metadata()
-        # 🆕 v1.2.2: 同步 Smart并发合并超时时间到管理器
+        # 🆕 v1.2.2-hotfix.1: 同步 Smart并发合并超时时间到管理器
         SmartConcurrentManager._EXPIRE_SECONDS = float(self.smart_concurrent_merge_wait)
         # 迁移提示
         self._log_removed_legacy_cooldown_config_usage()
@@ -6788,7 +6788,7 @@ class ChatPlus(Star):
         max_context: int,
     ) -> Optional[List]:
         """
-        🆕 v1.2.2: 并发等待后刷新历史消息
+        🆕 v1.2.2-hotfix.1: 并发等待后刷新历史消息
 
         在并发等待期间，前一条消息的AI回复可能已经保存到官方对话历史中。
         此方法从官方对话系统获取最新历史，与当前历史比较，
@@ -9554,7 +9554,7 @@ class ChatPlus(Star):
                 if self.debug_mode:
                     logger.info(f"  已标记消息 {message_id[:30]}... 为本插件处理中")
 
-        # 🆕 v1.2.2: 并发等待后刷新上下文
+        # 🆕 v1.2.2-hotfix.1: 并发等待后刷新上下文
         # 在并发等待期间，前一条消息的AI回复可能已经保存到官方对话历史中。
         # 如果不刷新，当前消息的上下文会缺少前一条消息的AI回复，
         # 导致AI可能误认为前一条消息的问题未被回答，从而重复回答。
@@ -10065,7 +10065,7 @@ class ChatPlus(Star):
         # 🔧 合并 system_prompt：优先使用重写结果，失败时 helper 内部已做保守回退
         req.system_prompt = rewrite_result.merged_system_prompt
 
-        # 🆕 v1.2.2: 追加插件静态指令到 system_prompt（提高整块缓存命中率）
+        # 🆕 v1.2.2-hotfix.1: 追加插件静态指令到 system_prompt（提高整块缓存命中率）
         # 注意: prompt 中仍保留静态前缀作为安全网，此处追加不替代
         plugin_static_instructions = event.get_extra(
             PLUGIN_CUSTOM_STATIC_INSTRUCTIONS, ""

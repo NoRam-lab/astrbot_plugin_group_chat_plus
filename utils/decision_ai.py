@@ -3,7 +3,7 @@
 负责调用AI判断是否应该回复消息（读空气功能）
 
 作者: Him666233
-版本: v1.2.2
+版本: v1.2.2-hotfix.1
 
 更新日志 v1.2.0:
 - 新增当前时间与活跃度提示，让AI知道现在是什么时候并据此调整回复倾向
@@ -788,7 +788,7 @@ class DecisionAI:
                     )
                 )
                 # 覆盖模式：用户自定义提示词在前（静态），动态内容在后
-                # 🔧 v1.2.2: sender_emphasis 提前到 formatted_message 之前，
+                # 🔧 v1.2.2-hotfix.1: sender_emphasis 提前到 formatted_message 之前，
                 # 让 AI 在阅读历史消息前就明确当前发送者身份
                 dynamic_prompt = (
                     custom_prompt
@@ -811,7 +811,7 @@ class DecisionAI:
                         )
             else:
                 # 拼接模式（默认）- 静态指令移入 system_prompt（整块缓存），prompt 仅保留动态内容
-                # 🔧 v1.2.2: 静态系统指令与 persona 合并传入 system_prompt，
+                # 🔧 v1.2.2-hotfix.1: 静态系统指令与 persona 合并传入 system_prompt，
                 # 使 AI 服务商的全块缓存（system message cache）覆盖全部静态指令。
                 static_instructions = DecisionAI.SYSTEM_DECISION_PROMPT
 

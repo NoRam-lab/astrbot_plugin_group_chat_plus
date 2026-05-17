@@ -10,7 +10,7 @@
 6. 失败处理和冷却机制
 
 作者: Him666233
-版本: v1.2.2
+版本: v1.2.2-hotfix.1
 
 v1.2.0 更新：
 - 支持其他插件的 on_llm_request 钩子注入（如 emotionai）
@@ -47,7 +47,7 @@ PLUGIN_CUSTOM_SYSTEM_PROMPT = "_group_chat_plus_system_prompt"
 PLUGIN_CUSTOM_PROMPT = "_group_chat_plus_prompt"
 PLUGIN_IMAGE_URLS = "_group_chat_plus_image_urls"
 PLUGIN_CURRENT_MESSAGE = "_group_chat_plus_current_message"
-# 🆕 v1.2.2: 存储插件静态系统指令，由 on_llm_request 追加到 system_prompt 末尾
+# 🆕 v1.2.2-hotfix.1: 存储插件静态系统指令，由 on_llm_request 追加到 system_prompt 末尾
 PLUGIN_CUSTOM_STATIC_INSTRUCTIONS = "_group_chat_plus_static_instructions"
 
 
@@ -4269,7 +4269,7 @@ class ProactiveChatManager:
                     logger.warning(f"[主动对话-人格获取] 获取失败: {e}，使用空人格")
 
             # 如果有begin_dialogs，将其追加到prompt末尾（不破坏静态前缀缓存）
-            # 🔧 v1.2.2: 静态指令不再拼接在 final_message 中，改为存储到 extra
+            # 🔧 v1.2.2-hotfix.1: 静态指令不再拼接在 final_message 中，改为存储到 extra
             # （由 on_llm_request 追加到 system_prompt）
             if begin_dialogs_text:
                 final_message += begin_dialogs_text
@@ -4316,7 +4316,7 @@ class ProactiveChatManager:
                     #    main.py 的 on_llm_request 钩子（priority=-1）会把
                     #    req.prompt 换回 final_message 供 AI 推理使用。
                     virtual_event.set_extra(PLUGIN_CURRENT_MESSAGE, "")
-                    # 🆕 v1.2.2: 静态指令通过 extra 传递，由 on_llm_request 追加到 system_prompt
+                    # 🆕 v1.2.2-hotfix.1: 静态指令通过 extra 传递，由 on_llm_request 追加到 system_prompt
                     _proactive_static_instructions = (
                         "\n\n" + "=" * 50 + "\n"
                         "【历史上下文识别】请注意以下几点：\n"
