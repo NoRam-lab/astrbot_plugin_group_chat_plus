@@ -545,7 +545,9 @@ const FlowData = {
                         }
                     },
                     keys: ['concurrent_wait_max_loops', 'concurrent_wait_interval',
-                           'concurrent_mode', 'enable_smart_batch_reply_hint', 'smart_concurrent_merge_wait'],
+                           'concurrent_mode', 'enable_smart_batch_reply_hint',
+                           'smart_concurrent_merge_wait', 'smart_concurrent_max_batch_size',
+                           'smart_concurrent_claim_delay'],
                     onFail: 'pass',
                     next: null
                 }

@@ -154,7 +154,7 @@
 
 ## 桌面端兼容
 
-> v1.2.2-hotfix.1 新增。AstrBot 桌面端（Desktop Edition）使用 Tauri 托管后端进程，重启机制与标准版不同。详细说明见 [桌面端兼容文档](DESKTOP_COMPATIBILITY.md)。
+> v1.2.2-hotfix.1+ 新增。AstrBot 桌面端（Desktop Edition）使用 Tauri 托管后端进程，重启机制与标准版不同。详细说明见 [桌面端兼容文档](DESKTOP_COMPATIBILITY.md)。
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
@@ -220,7 +220,9 @@
 | `concurrent_wait_interval` | float | `1.0` | 通用并发等待的每轮检测间隔（秒）。例如默认 `10 × 1.0 = 最多等待 10 秒`。即使 `concurrent_mode=smart`，主动对话占用等待和冷群缓存自动转正等待目前仍复用这套通用轮询参数，而不是切换成 Smart 专属等待逻辑 |
 | `concurrent_mode` | string | `"legacy"` | 并发模式。`legacy` = 传统逐条等待处理，是普通对话链路最基础、最兜底的并发保护方式；`smart` = 在普通对话主线上优先尝试按真实到达顺序合并批次，让决策AI/回复AI一起感知当前消息后紧接着到达的追加消息。注意：这个模式选择主要只影响普通对话流程，不直接改变主动对话流程本身；即使选择了 `smart`，传统并发等待/兜底保护也不会消失，主动对话占用检测以及若干等待链路仍然复用传统轮询逻辑 |
 | `enable_smart_batch_reply_hint` | bool | `true` | 仅在 `concurrent_mode=smart` 时生效。开启后，回复阶段会动态提示 AI：当前触发对象仍是主要回复对象，但可以像真人一样自然顺带回应批次中的其他消息；不值得回的也可忽略。该提示只存在于运行时，保存历史前会自动过滤 |
-| `smart_concurrent_merge_wait` | float | `30.0` | Smart 模式下批次待合并超时时间（秒） |
+| `smart_concurrent_merge_wait` | float | `30.0` | Smart 模式下批次待合并超时时间（秒）。消息在待合并池中超过此时间未被吸收，将被自动清理并转为独立处理 |
+| `smart_concurrent_max_batch_size` | int | `20` | Smart 模式单批次最多吸收的消息数。达到此数后停止吸收，剩余消息留在待合并池由下一批次处理。与合并超时时间同时生效，两者任一先触发即停止合并。建议范围 1-50 |
+| `smart_concurrent_claim_delay` | float | `0.3` | Smart 模式快照前收拢延迟（秒）。anchor 在调用 claim_batch（一次性快照）前等待的极短时间，用于给几乎同时到达的消息挂载 payload 的机会。0=不等待，建议 0.1-0.5。不是收集窗口（不会持续收消息） |
 
 ---
 
@@ -331,7 +333,7 @@
 | `poke_message_mode` | string | `"bot_only"` | 戳一戳响应模式：`ignore`（完全忽略）、`bot_only`（仅响应戳机器人）、`all`（响应所有戳一戳）。**只有当前模式允许本插件实际处理的真实 poke**，才会自动生成并保存“谁戳了谁”的历史事件文本；被该模式提前忽略的 poke 不会进入这一步 |
 | `poke_bot_skip_probability` | bool | `true` | 戳机器人时跳过概率检查，直接进入AI决策 |
 | `poke_bot_probability_boost_reference` | float | `0.3` | 戳一戳概率提升参考值 |
-| `poke_reverse_on_poke_probability` | float | `0.0` | 被戳后立即反戳的概率（0 = 不反戳）。若反戳动作真实成功，会额外单独保存一条 AI 视角的戳一戳历史事件 |
+| `poke_reverse_on_poke_probability` | float | `0.0` | 被戳后立即反戳的概率（0 = 不反戳）。若反戳动作真实成功，会先以用户视角保存发起者的戳一戳事件，再以 assistant 视角保存 AI 反戳动作，两条记录均写入官方存储和自定义存储，绑定当前会话 |
 | `enable_poke_after_reply` | bool | `false` | 回复消息后戳用户一下。若动作真实成功，会额外单独保存一条 AI 视角的戳一戳历史事件 |
 | `poke_after_reply_probability` | float | `0.1` | 回复后戳用户的概率 |
 | `poke_after_reply_delay` | float | `0.5` | 回复后到戳之间的延迟（秒） |

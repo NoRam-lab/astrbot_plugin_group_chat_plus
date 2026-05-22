@@ -38,8 +38,12 @@ class SystemPromptRewriter:
     _KNOWN_LTM_PATTERNS = [
         re.compile(
             (
+                # 精确匹配平台 LTM Normal 模式注入到 system_prompt 的格式
+                # 每条记录: [昵称/HH:MM:SS]: 内容（可多行），记录间以 \n---\n 分隔
+                # 使用 (?!---\n) 负向前瞻防止内容跨越多条记录，同时支持单条消息内换行
                 r"You are now in a chatroom\. The chat history is as follows:\s*\n?"
-                r"[^\n]*(?:\n---\n[^\n]*)*"
+                r"(?:\[[^\]]+/\d{2}:\d{2}:\d{2}\]:.*(?:\n(?!---\n).*)*)"
+                r"(?:\n---\n\[[^\]]+/\d{2}:\d{2}:\d{2}\]:.*(?:\n(?!---\n).*)*)*"
             ),
             re.IGNORECASE,
         ),

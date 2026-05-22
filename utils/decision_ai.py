@@ -3,7 +3,7 @@
 负责调用AI判断是否应该回复消息（读空气功能）
 
 作者: Him666233
-版本: v1.2.2-hotfix.1
+版本: V1.2.3
 
 更新日志 v1.2.0:
 - 新增当前时间与活跃度提示，让AI知道现在是什么时候并据此调整回复倾向
@@ -225,11 +225,16 @@ class DecisionAI:
             return
 
         reasoning_text = (parse_result or {}).get("reasoning_text")
-        if reasoning_text:
-            logger.info(f"{log_prefix} 推理过程:\n{reasoning_text}")
-
         protocol_followed = (parse_result or {}).get("protocol_followed")
         tail_line = (parse_result or {}).get("tail_line") or ""
+
+        if reasoning_text:
+            logger.info(f"{log_prefix} 推理过程:\n{reasoning_text}")
+        elif protocol_followed is True:
+            logger.info(
+                f"{log_prefix} 本次 AI 未输出推理过程，直接给出判断结果。最终答案: {tail_line}"
+            )
+
         if protocol_followed is False:
             if tail_line:
                 logger.warning(

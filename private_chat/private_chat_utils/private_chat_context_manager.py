@@ -10,7 +10,7 @@
 - 详细的保存日志便于调试
 
 作者: Him666233
-版本: v1.2.2-hotfix.1
+版本: V1.2.3
 """
 
 from typing import List, Dict, Any, Optional
@@ -1482,14 +1482,19 @@ class ContextManager:
 
             # 添加当前消息部分（强调重要性）
             formatted_parts.append("")  # 空行分隔
-            formatted_parts.append("=" * 50)
+            formatted_parts.append("")  # 额外空行，增强视觉隔离
+            formatted_parts.append("=" * 60)
             formatted_parts.append(
-                "=== 【重要】当前新消息（请优先关注这条消息的核心内容）==="
+                "=== 以上全部是历史消息，你已经处理过了，不要重复回答 ==="
             )
-            formatted_parts.append("=" * 50)
+            formatted_parts.append(
+                "=== 【重要】以下是当前新消息（请优先关注这条消息的核心内容）==="
+            )
+            formatted_parts.append("=" * 60)
             safe_current_message = ContextManager._content_to_safe_text(current_message)
             formatted_parts.append(safe_current_message)
-            formatted_parts.append("=" * 50)
+            formatted_parts.append("=" * 60)
+            formatted_parts.append("")  # 额外空行，增强视觉隔离
 
             result = "\n".join(formatted_parts)
             if DEBUG_MODE:
@@ -1557,6 +1562,8 @@ class ContextManager:
                 or "=== 可用工具列表 ===" in cleaned_message
                 or "【当前对话对象】重要提醒" in cleaned_message
                 or "【第一重要】识别当前发送者：" in cleaned_message
+                or "=== 以上全部是历史消息" in cleaned_message
+                or "【禁止重复-你的历史回复】" in cleaned_message
             ):
                 # 如果仍然包含系统提示，再次清理
                 import re
@@ -1611,6 +1618,22 @@ class ContextManager:
                 )
                 cleaned_message = re.sub(
                     r"=+\n*.*?【重要】当前新消息.*?\n*=+", "", cleaned_message
+                )
+                # 清理历史/当前消息分隔线（format_context_for_ai 输出的边界标记）
+                cleaned_message = re.sub(
+                    r"=+\n*=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\n*=+",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"=== 【重要】以下是当前新消息（请优先关注这条消息的核心内容）===",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"【禁止重复-你的历史回复】",
+                    "",
+                    cleaned_message,
                 )
                 cleaned_message = cleaned_message.strip()
                 if DEBUG_MODE:
@@ -1803,6 +1826,8 @@ class ContextManager:
                 or "=== 可用工具列表 ===" in cleaned_message
                 or "【当前对话对象】重要提醒" in cleaned_message
                 or "【第一重要】识别当前发送者：" in cleaned_message
+                or "=== 以上全部是历史消息" in cleaned_message
+                or "【禁止重复-你的历史回复】" in cleaned_message
             ):
                 # 如果仍然包含系统提示，再次清理
                 import re
@@ -1857,6 +1882,22 @@ class ContextManager:
                 )
                 cleaned_message = re.sub(
                     r"=+\n*.*?【重要】当前新消息.*?\n*=+", "", cleaned_message
+                )
+                # 清理历史/当前消息分隔线（format_context_for_ai 输出的边界标记）
+                cleaned_message = re.sub(
+                    r"=+\n*=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\n*=+",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"=== 【重要】以下是当前新消息（请优先关注这条消息的核心内容）===",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"【禁止重复-你的历史回复】",
+                    "",
+                    cleaned_message,
                 )
                 cleaned_message = cleaned_message.strip()
                 if DEBUG_MODE:
@@ -2060,6 +2101,8 @@ class ContextManager:
                 "[系统提示]" in cleaned_message
                 or "[戳一戳提示]" in cleaned_message
                 or "[戳过对方提示]" in cleaned_message
+                or "=== 以上全部是历史消息" in cleaned_message
+                or "【禁止重复-你的历史回复】" in cleaned_message
             ):
                 # 如果仍然包含系统提示，再次清理
                 import re
@@ -2072,6 +2115,22 @@ class ContextManager:
                 )
                 cleaned_message = re.sub(
                     r"\n*\s*\[戳过对方提示\][^\n]*", "", cleaned_message
+                )
+                # 清理历史/当前消息分隔线
+                cleaned_message = re.sub(
+                    r"=+\n*=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\n*=+",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"=== 【重要】以下是当前新消息（请优先关注这条消息的核心内容）===",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"【禁止重复-你的历史回复】",
+                    "",
+                    cleaned_message,
                 )
                 cleaned_message = cleaned_message.strip()
 

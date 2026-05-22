@@ -32,7 +32,7 @@
 - @消息会跳过所有判断直接回复
 
 作者: Him666233
-版本: v1.2.2-hotfix.1
+版本: V1.2.3
 
 v1.2.1 更新内容：
 - 🆕 Web管理面板 - 全新可视化管理界面，支持JWT认证、访问日志、统计图表、IP安全管理
@@ -152,7 +152,7 @@ from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
     "astrbot_plugin_group_chat_plus",
     "Him666233",
     "一个以AI读空气为主的群聊聊天效果增强插件",
-    "v1.2.2-hotfix.1",
+    "V1.2.3",
     "https://github.com/Him666233/astrbot_plugin_group_chat_plus",
 )
 class ChatPlus(Star):
@@ -253,7 +253,16 @@ class ChatPlus(Star):
             "[第三方插件补充信息结束]",
             "[第三方插件注入上下文]",
         )
-        return any(marker in text for marker in runtime_markers)
+        if any(marker in text for marker in runtime_markers):
+            return True
+        # 平台 LTM 注入特征检测：需要同时命中 header 短语 + 条目格式 [name/HH:MM:SS]:
+        # 单靠 header 短语可能误匹配第三方插件内容，加上条目格式确保精确识别
+        if "You are now in a chatroom" in text:
+            import re
+
+            if re.search(r"\[\S+?/\d{2}:\d{2}:\d{2}\]:", text):
+                return True
+        return False
 
     @staticmethod
     def _is_valid_third_party_text(text: str, plugin_full_prompt: str = "") -> bool:
@@ -1870,6 +1879,12 @@ class ChatPlus(Star):
         self.smart_concurrent_merge_wait = config.get(
             "smart_concurrent_merge_wait", 30.0
         )  # 🆕 v1.2.2-hotfix.1: Smart模式合并超时时间（秒）
+        self.smart_concurrent_max_batch_size = config.get(
+            "smart_concurrent_max_batch_size", 20
+        )  # 🆕 Smart模式单批次最多吸收的消息数（防止极端并发下上下文溢出）
+        self.smart_concurrent_claim_delay = config.get(
+            "smart_concurrent_claim_delay", 0.3
+        )  # 🆕 Smart模式快照前收拢延迟（秒），给几乎同时到达的消息一个挂载payload的机会
         self.typing_delay_timeout_warning = config.get(
             "typing_delay_timeout_warning", 5
         )  # 打字延迟超时警告
@@ -2420,7 +2435,7 @@ class ChatPlus(Star):
 
         # ========== 日志输出 ==========
         logger.info("=" * 50)
-        logger.info("群聊增强插件已加载 - v1.2.2-hotfix.1")
+        logger.info("群聊增强插件已加载 - V1.2.3")
         logger.info(
             f"🔘 群聊功能总开关: {'✓ 已启用' if self.enable_group_chat else '✗ 已禁用'}"
         )
@@ -2942,6 +2957,10 @@ class ChatPlus(Star):
         self._emit_session_metadata()
         # 🆕 v1.2.2-hotfix.1: 同步 Smart并发合并超时时间到管理器
         SmartConcurrentManager._EXPIRE_SECONDS = float(self.smart_concurrent_merge_wait)
+        # 🆕 同步 Smart批次最大消息数到管理器
+        SmartConcurrentManager._MAX_BATCH_SIZE = max(
+            1, int(self.smart_concurrent_max_batch_size)
+        )
         # 迁移提示
         self._log_removed_legacy_cooldown_config_usage()
         # 启动旧冷却数据后台迁移任务
@@ -3424,6 +3443,24 @@ class ChatPlus(Star):
             if not self.enable_private_chat or not event.is_private_chat():
                 return
 
+            # 🔘 直接打掉平台产生的真空消息（与群聊入口一致）
+            _raw_msg_str = event.get_message_str()
+            _msg_components = None
+            try:
+                if hasattr(event, "message_obj") and hasattr(
+                    event.message_obj, "message"
+                ):
+                    _msg_components = event.message_obj.message
+            except Exception:
+                pass
+            if (not _raw_msg_str or not _raw_msg_str.strip()) and not _msg_components:
+                logger.info(
+                    f"🚫 [空消息过滤-私信] 检测到平台产生的真空消息（发送者: {event.get_sender_name()}），"
+                    f"已直接丢弃"
+                )
+                event.call_llm = True
+                return
+
             # 获取消息ID
             msg_id = self._get_processing_id(event)
             source_event_id = self._build_source_event_id(event)
@@ -3511,6 +3548,26 @@ class ChatPlus(Star):
         try:
             # 🔘 检查群聊功能总开关
             if not self.enable_group_chat or event.is_private_chat():
+                return
+
+            # 🔘 直接打掉平台产生的真空消息（消息链为空，无任何内容）
+            # 这类消息通常是平台异常导致的空事件，不应进入任何后续流程
+            # （窗口消息机制、注意力机制、smart合并、概率筛选等）
+            _raw_msg_str = event.get_message_str()
+            _msg_components = None
+            try:
+                if hasattr(event, "message_obj") and hasattr(
+                    event.message_obj, "message"
+                ):
+                    _msg_components = event.message_obj.message
+            except Exception:
+                pass
+            if (not _raw_msg_str or not _raw_msg_str.strip()) and not _msg_components:
+                logger.info(
+                    f"🚫 [空消息过滤] 检测到平台产生的真空消息（发送者: {event.get_sender_name()}），"
+                    f"已直接丢弃，不进入任何后续流程"
+                )
+                event.call_llm = True
                 return
 
             self._check_compliance_status()
@@ -4383,6 +4440,50 @@ class ChatPlus(Star):
             except Exception:
                 logger.warning("【会话重置】注意力状态持久化失败", exc_info=True)
 
+            # —— 清理等待窗口（key 为 (chat_id, user_id) 元组）——
+            try:
+                target_ids = {str(chat_id)}
+                stale_windows = [
+                    wk
+                    for wk, _ in self._group_wait_windows.items()
+                    if isinstance(wk, tuple)
+                    and len(wk) >= 1
+                    and str(wk[0]) in target_ids
+                ]
+                for wk in stale_windows:
+                    self._group_wait_windows.pop(wk, None)
+                if stale_windows:
+                    logger.info(
+                        "【会话重置】已清理等待窗口 chat_id=%s, 清理数=%s",
+                        chat_id,
+                        len(stale_windows),
+                    )
+            except Exception:
+                logger.warning("【会话重置】清理等待窗口失败", exc_info=True)
+
+            # —— 清理主动对话处理中标记 ——
+            try:
+                if hasattr(self, "proactive_processing_sessions"):
+                    self.proactive_processing_sessions.pop(chat_key, None)
+                    self.proactive_processing_sessions.pop(str(chat_id), None)
+            except Exception:
+                logger.warning("【会话重置】清理主动对话处理中标记失败", exc_info=True)
+
+            # —— 清理对话活跃度映射 & 疲劳阻塞 ——
+            try:
+                for key in {chat_key, str(chat_id)}:
+                    if key and key in AttentionManager._conversation_activity_map:
+                        del AttentionManager._conversation_activity_map[key]
+                        logger.info("【会话重置】已清理对话活跃度映射 key=%s", key)
+                        break
+                for key in {chat_key, str(chat_id)}:
+                    if key and key in AttentionManager._fatigue_attention_block:
+                        del AttentionManager._fatigue_attention_block[key]
+                        logger.info("【会话重置】已清理疲劳阻塞 key=%s", key)
+                        break
+            except Exception:
+                logger.warning("【会话重置】清理活跃度/疲劳阻塞失败", exc_info=True)
+
             logger.info(
                 "【会话重置】完成: platform=%s, chat_id=%s",
                 platform_name,
@@ -4597,6 +4698,41 @@ class ChatPlus(Star):
                     )
             except Exception:
                 logger.warning("【插件重置】清空冷却状态失败", exc_info=True)
+            try:
+                # 等待窗口（key 为 (chat_id, user_id) 元组）
+                window_count = len(self._group_wait_windows)
+                self._group_wait_windows.clear()
+                if window_count:
+                    logger.info("【插件重置】已清空等待窗口 清理数=%s", window_count)
+            except Exception:
+                logger.warning("【插件重置】清空等待窗口失败", exc_info=True)
+            try:
+                # 主动对话处理中标记
+                if hasattr(self, "proactive_processing_sessions"):
+                    pps_count = len(self.proactive_processing_sessions)
+                    self.proactive_processing_sessions.clear()
+                    if pps_count:
+                        logger.info(
+                            "【插件重置】已清空主动对话处理中标记 清理数=%s", pps_count
+                        )
+            except Exception:
+                logger.warning("【插件重置】清空主动对话处理中标记失败", exc_info=True)
+            try:
+                # 对话活跃度映射 & 疲劳阻塞（AttentionManager 类级字典）
+                act_count = len(
+                    getattr(AttentionManager, "_conversation_activity_map", {})
+                )
+                AttentionManager._conversation_activity_map.clear()
+                if act_count:
+                    logger.info("【插件重置】已清空对话活跃度映射 清理数=%s", act_count)
+                fat_count = len(
+                    getattr(AttentionManager, "_fatigue_attention_block", {})
+                )
+                AttentionManager._fatigue_attention_block.clear()
+                if fat_count:
+                    logger.info("【插件重置】已清空疲劳阻塞 清理数=%s", fat_count)
+            except Exception:
+                logger.warning("【插件重置】清空活跃度/疲劳阻塞失败", exc_info=True)
             try:
                 # 删除本插件数据目录下的持久化缓存文件/目录
                 data_dir = StarTools.get_data_dir()
@@ -4877,8 +5013,10 @@ class ChatPlus(Star):
                 transient_probability_boost=at_all_transient_probability_boost,
             )
             if not should_process:
+                logger.info(
+                    "【步骤5】概率判断失败，丢弃消息（已缓存原始消息避免上下文断裂）"
+                )
                 if self.debug_mode:
-                    logger.info("【步骤5】概率判断失败,丢弃消息")
                     logger.info("=" * 60)
                 return False
 
@@ -5349,14 +5487,10 @@ class ChatPlus(Star):
             "\n\n[系统提示-Smart并发]\n"
             f"你这次面对的是一个 Smart 并发批次：在 {sender_name}(ID:{sender_id}) 这条当前消息之后，"
             f"又紧接着出现了 {total_messages} 条追加消息。{scenario_text}。\n"
-            "这些消息已经按发送者名字和ID标出，你需要像真人在群聊里一样自然处理：\n"
-            f"1. 仍然以 {sender_name}(ID:{sender_id}) 作为这次的主要回复对象，不要把当前主对象切丢。\n"
-            "2. 如果其他人的消息确实值得顺带回应，可以在一条自然回复里一起带到。\n"
-            "3. 如果其他人的消息不值得回，完全可以忽略，不需要强行每个人都回答。\n"
-            "4. 不要机械逐条点名答题，不要把一条群聊回复写成客服式分项回复。\n"
-            "5. 最终仍然只输出一条自然群聊消息。\n"
-            "以下是这批追加消息的汇总：\n"
+            "这些追加消息已按发送者名字和ID标出，帮你理解完整对话背景：\n"
             f"{summary_block}\n"
+            f"你只需回复 {sender_name}(ID:{sender_id}) 的当前消息。追加消息是背景参考，"
+            f"直接自然说话即可，不要逐条回复、不要进行任何判断或分析。\n"
         )
 
     def _update_last_reply_target(
@@ -7970,6 +8104,37 @@ class ChatPlus(Star):
                     logger.info("【反戳】已执行反戳")
                 if self.poke_trace_enabled:
                     self._register_poke_trace(chat_id, str(sender_id))
+                # 保存用户的戳一戳事件到历史记录（用户视角），确保 AI 上下文完整性
+                try:
+                    user_poke_text = MessageProcessor.build_persistent_poke_event_text(
+                        poke_info
+                    )
+                    if user_poke_text:
+                        await ContextManager.save_user_message(
+                            event,
+                            user_poke_text,
+                            self.context,
+                            skip_custom_storage=True,
+                        )
+                        try:
+                            await (
+                                ContextManager.save_to_official_conversation_with_cache(
+                                    event,
+                                    [],
+                                    user_poke_text,
+                                    "",
+                                    self.context,
+                                    save_kind="poke_event",
+                                )
+                            )
+                        except Exception as user_official_err:
+                            logger.warning(
+                                f"[戳一戳事件] 保存用户戳一戳到官方会话失败: {user_official_err}"
+                            )
+                except Exception as user_save_err:
+                    logger.warning(
+                        f"[戳一戳事件] 保存用户戳一戳事件到历史记录失败: {user_save_err}"
+                    )
                 try:
                     target_name = await self._resolve_group_member_name(
                         event,
@@ -9198,15 +9363,13 @@ class ChatPlus(Star):
                     )
                     logger.info(
                         f"🔀 [Smart并发] 消息 {processing_id[:20]}... 已在决策前被更早批次吸收，跳过独立处理"
+                        f"（其内容已通过 anchor {anchor_processing_id[:20] if anchor_processing_id else '?'}... 的批次保留，"
+                        f"将在 anchor 回复后一并保存）"
                     )
                     event.call_llm = True
                     await SmartConcurrentManager.remove_self(chat_id, processing_id)
                     self._message_cache_snapshots.pop(processing_id, None)
                     self._smart_batch_snapshots.pop(processing_id, None)
-                    if self.debug_mode and anchor_processing_id:
-                        logger.info(
-                            f"  🔀 [Smart并发] 吸收当前消息的 anchor: {anchor_processing_id[:20]}..."
-                        )
                     return
 
                 if await SmartConcurrentManager.has_earlier_pending(
@@ -9219,6 +9382,15 @@ class ChatPlus(Star):
                     await asyncio.sleep(self.concurrent_wait_interval)
                     continue
 
+                # 快照前收拢延迟：给几乎同时到达的消息一个挂载 payload 的窗口，
+                # 避免晚到 50ms 的消息被分到下一批导致 AI 多回一段
+                if (
+                    smart_wait_idx == 0
+                    and not _is_forced
+                    and self.smart_concurrent_claim_delay > 0
+                ):
+                    await asyncio.sleep(self.smart_concurrent_claim_delay)
+
                 smart_claim = await SmartConcurrentManager.claim_batch(
                     chat_id, processing_id
                 )
@@ -9226,15 +9398,13 @@ class ChatPlus(Star):
                     anchor_processing_id = smart_claim.get("anchor_processing_id")
                     logger.info(
                         f"🔀 [Smart并发] 消息 {processing_id[:20]}... 已在 claim 阶段被更早 anchor 吸收，跳过独立处理"
+                        f"（其内容已通过 anchor {anchor_processing_id[:20] if anchor_processing_id else '?'}... 的批次保留，"
+                        f"将在 anchor 回复后一并保存）"
                     )
                     event.call_llm = True
                     await SmartConcurrentManager.remove_self(chat_id, processing_id)
                     self._message_cache_snapshots.pop(processing_id, None)
                     self._smart_batch_snapshots.pop(processing_id, None)
-                    if self.debug_mode and anchor_processing_id:
-                        logger.info(
-                            f"  🔀 [Smart并发] 吸收当前消息的 anchor: {anchor_processing_id[:20]}..."
-                        )
                     return
                 if smart_claim.get("is_anchor"):
                     merged_entries = smart_claim.get("merged_entries", []) or []
@@ -9478,10 +9648,36 @@ class ChatPlus(Star):
                     event.call_llm = True
                     await SmartConcurrentManager.remove_self(chat_id, message_id)
                     self._message_cache_snapshots.pop(message_id, None)
-                    self._smart_batch_snapshots.pop(message_id, None)
-                    if self.debug_mode and anchor_processing_id:
+                    # 在丢弃 _smart_batch_snapshots 前，将其中的 followers 转为普通缓存
+                    # （与决策AI判定不回复时的处理逻辑一致，见下方 9414-9425 行）
+                    _smart_batch_followers = self._smart_batch_snapshots.pop(
+                        message_id, None
+                    )
+                    if _smart_batch_followers:
+                        _cached_follower_count = 0
+                        for _sm in _smart_batch_followers:
+                            _fallback = dict(_sm)
+                            _fallback.pop("window_buffered", None)
+                            _fallback.pop("smart_batch_dynamic_hint", None)
+                            self.cache_manager.add_to_cache(
+                                chat_id,
+                                _fallback,
+                                source="Smart并发-决策后被吸收-followers",
+                            )
+                            _cached_follower_count += 1
                         logger.info(
-                            f"  🔀 [Smart并发] 吸收当前消息的 anchor: {anchor_processing_id[:20]}..."
+                            f"📦 [Smart并发] 已将 {_cached_follower_count} 条被吸收的 follower 消息回退为普通缓存"
+                        )
+                    # 同时缓存 anchor 自身
+                    if cached_message_data:
+                        self.cache_manager.add_to_cache(
+                            chat_id,
+                            dict(cached_message_data),
+                            source="Smart并发-决策后被吸收-anchor",
+                        )
+                        logger.info(
+                            f"📦 [Smart并发] 已缓存被吸收的 anchor 消息，等待后续转正: "
+                            f"{str(cached_message_data.get('content', ''))[:80]}..."
                         )
                     return
 
@@ -10632,7 +10828,7 @@ class ChatPlus(Star):
                         f"[窗口追加标记] 添加标记时异常（降级忽略）: {_wb_marker_err}"
                     )
 
-                # 保存AI回复到自定义存储（使用过滤后的内容）
+                # 保存AI回复到官方存储（使用过滤后的内容）
                 await ContextManager.save_bot_message(
                     event, bot_reply_to_save, self.context, skip_custom_storage=True
                 )
@@ -11644,7 +11840,7 @@ class ChatPlus(Star):
                     bot_reply_to_save = interleaved_reply
                 logger.info("[工具调用] 兜底保存: 已构建交错排列的工具调用记录")
 
-            # 保存AI回复到自定义存储
+            # 保存AI回复到官方存储
             await ContextManager.save_bot_message(
                 event, bot_reply_to_save, self.context, skip_custom_storage=True
             )

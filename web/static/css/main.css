@@ -292,6 +292,12 @@ body.config-panel-open .config-file-badge {
 ::-webkit-scrollbar-thumb { background: var(--text-muted); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--accent-red); }
 
+/* Firefox 滚动条降级 */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-muted) transparent;
+}
+
 /* ========== Confirm / Alert Overlay ========== */
 .confirm-overlay {
     position: fixed;
@@ -378,6 +384,7 @@ body.config-panel-open .config-file-badge {
 
 .log-table {
     width: 100%;
+    table-layout: fixed;
     border-collapse: collapse;
     font-size: 13px;
 }
@@ -558,6 +565,7 @@ body.config-panel-open .config-file-badge {
     border: 1px solid var(--border-color);
     background: var(--glass-bg);
     backdrop-filter: blur(var(--glass-blur));
+    -webkit-backdrop-filter: blur(var(--glass-blur));
     box-shadow: var(--glass-shadow);
     color: var(--text-primary);
     display: flex;
@@ -730,6 +738,7 @@ body.config-panel-open .config-file-badge {
 /* ========== Data Table (compact) ========== */
 .data-table {
     width: 100%;
+    table-layout: fixed;
     border-collapse: collapse;
     font-size: 12px;
 }

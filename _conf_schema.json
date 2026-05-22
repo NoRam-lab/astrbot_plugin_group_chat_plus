@@ -379,6 +379,18 @@
         "hint": "仅在 concurrent_mode=smart 时生效。消息注册为待合并后，超过此时间（秒）未被合并则自动从待合并队列中清理，随后正常独立处理。默认30秒（通常无需修改，实际合并窗口取决于AI决策耗时）。",
         "default": 30.0
     },
+    "smart_concurrent_max_batch_size": {
+        "description": "📦 Smart模式：单批次最多合并消息数",
+        "type": "int",
+        "hint": "仅在 concurrent_mode=smart 时生效。单批次最多吸收多少条后续消息进入合并。达到此数量后停止吸收，其余消息留在待合并池由下一批次处理。设置范围 1-50，默认 20。配合合并超时时间，两者中任一先触发即停止合并。",
+        "default": 20
+    },
+    "smart_concurrent_claim_delay": {
+        "description": "⏱️ Smart模式：快照前收拢延迟（秒）",
+        "type": "float",
+        "hint": "仅在 concurrent_mode=smart 时生效。anchor 在调用 claim_batch（一次性快照）之前等待的极短时间（秒），用于给几乎同时到达的消息挂载 payload 的机会。设置 0=不等待（立即快照），默认 0.3 秒。值越大收拢越多但延迟越高，建议 0.1-0.5。此延迟不是收集窗口（不会持续收消息），只是在快照前给一个极短的同步间隙。",
+        "default": 0.3
+    },
     "reply_ai_prompt_mode": {
         "description": "回复AI提示词模式",
         "type": "string",
@@ -709,7 +721,7 @@
     "poke_reverse_on_poke_probability": {
         "description": "收到戳一戳时反戳概率",
         "type": "float",
-        "hint": "【新功能】当检测到戳一戳消息且本插件未忽略时，按此概率直接反戳发起者，并丢弃本插件后续处理（不拦截消息）。范围0-1；0=禁用，1=100%触发",
+        "hint": "【新功能】当检测到戳一戳消息且本插件未忽略时，按此概率直接反戳发起者，并结束本插件后续处理（不拦截消息）。反戳成功时，会先将发起者的戳一戳事件以用户视角保存到历史记录，再将AI反戳动作以assistant视角保存，两条记录均写入官方存储和自定义存储，绑定当前会话。范围0-1；0=禁用，1=100%触发",
         "default": 0.0
     },
     "enable_poke_after_reply": {

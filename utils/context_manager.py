@@ -10,7 +10,7 @@
 - 详细的保存日志便于调试
 
 作者: Him666233
-版本: v1.2.2-hotfix.1
+版本: V1.2.3
 """
 
 from typing import List, Dict, Any, Optional
@@ -1548,17 +1548,19 @@ class ContextManager:
 
             # 添加当前消息部分（强调重要性）
             formatted_parts.append("")  # 空行分隔
-            formatted_parts.append("=" * 50)
+            formatted_parts.append("")  # 额外空行，增强视觉隔离
+            formatted_parts.append("=" * 60)
             formatted_parts.append(
                 "=== 以上全部是历史消息，你已经处理过了，不要重复回答 ==="
             )
             formatted_parts.append(
                 "=== 【重要】以下是当前新消息（请优先关注这条消息的核心内容）==="
             )
-            formatted_parts.append("=" * 50)
+            formatted_parts.append("=" * 60)
             safe_current_message = ContextManager._content_to_safe_text(current_message)
             formatted_parts.append(safe_current_message)
-            formatted_parts.append("=" * 50)
+            formatted_parts.append("=" * 60)
+            formatted_parts.append("")  # 额外空行，增强视觉隔离
 
             # 窗口缓冲消息区域（当前消息之后紧接着发的消息）
             try:
@@ -1568,10 +1570,7 @@ class ContextManager:
                         "--- 以下是你收到这条消息后，同一用户或其他用户紧接着又发的消息 ---"
                     )
                     formatted_parts.append(
-                        "这些消息不一定是对你说的，请自行参考判断是否需要在回复中一并考虑。"
-                    )
-                    formatted_parts.append(
-                        "重要：这些追加消息的发送者可能与当前对话对象不同，请根据每条消息的发送者名字和ID仔细区分。"
+                        "这些追加消息帮助你理解完整对话背景。追加消息的发送者可能与当前对话对象不同，注意根据名字和ID区分。"
                     )
 
                     # 按时间排序
@@ -1709,6 +1708,8 @@ class ContextManager:
                 or "【当前对话对象】重要提醒" in cleaned_message
                 or "【第一重要】识别当前发送者：" in cleaned_message
                 or "紧接着又发的消息" in cleaned_message
+                or "=== 以上全部是历史消息" in cleaned_message
+                or "【禁止重复-你的历史回复】" in cleaned_message
             ):  # 如果仍然包含系统提示，再次清理
                 import re
 
@@ -1776,6 +1777,32 @@ class ContextManager:
                 # 清理窗口缓冲消息区域（追加消息提示词）
                 cleaned_message = re.sub(
                     r"--- 以下是你收到这条消息后，同一用户或其他用户紧接着又发的消息 ---[\s\S]*?--- 以上为紧接着的追加消息 ---",
+                    "",
+                    cleaned_message,
+                )
+                # 清理历史/当前消息分隔线（format_context_for_ai 输出的边界标记）
+                cleaned_message = re.sub(
+                    r"=+\n*=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\n*=+",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"=== 【重要】以下是当前新消息（请优先关注这条消息的核心内容）===",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"=== 【重要】当前新消息（请优先关注这条消息的核心内容）===",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"【禁止重复-你的历史回复】",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"【📦近期未回复】\s*",
                     "",
                     cleaned_message,
                 )
@@ -1982,6 +2009,8 @@ class ContextManager:
                 or "【当前对话对象】重要提醒" in cleaned_message
                 or "【第一重要】识别当前发送者：" in cleaned_message
                 or "紧接着又发的消息" in cleaned_message
+                or "=== 以上全部是历史消息" in cleaned_message
+                or "【禁止重复-你的历史回复】" in cleaned_message
             ):  # 如果仍然包含系统提示，再次清理
                 cleaned_message = re.sub(
                     r"\n+\s*\[系统提示\][^\n]*", "", cleaned_message
@@ -2047,6 +2076,32 @@ class ContextManager:
                 # 清理窗口缓冲消息区域（追加消息提示词）
                 cleaned_message = re.sub(
                     r"--- 以下是你收到这条消息后，同一用户或其他用户紧接着又发的消息 ---[\s\S]*?--- 以上为紧接着的追加消息 ---",
+                    "",
+                    cleaned_message,
+                )
+                # 清理历史/当前消息分隔线（format_context_for_ai 输出的边界标记）
+                cleaned_message = re.sub(
+                    r"=+\n*=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\n*=+",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"=== 【重要】以下是当前新消息（请优先关注这条消息的核心内容）===",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"=== 【重要】当前新消息（请优先关注这条消息的核心内容）===",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"【禁止重复-你的历史回复】",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"【📦近期未回复】\s*",
                     "",
                     cleaned_message,
                 )
@@ -2255,6 +2310,8 @@ class ContextManager:
                 or "[戳一戳提示]" in cleaned_message
                 or "[戳过对方提示]" in cleaned_message
                 or "[第三方插件补充信息]" in cleaned_message
+                or "=== 以上全部是历史消息" in cleaned_message
+                or "【禁止重复-你的历史回复】" in cleaned_message
             ):
                 # 如果仍然包含系统提示，再次清理
                 import re
@@ -2270,6 +2327,22 @@ class ContextManager:
                 )
                 cleaned_message = re.sub(
                     r"\[第三方插件补充信息\][\s\S]*?\[第三方插件补充信息结束\]",
+                    "",
+                    cleaned_message,
+                )
+                # 清理历史/当前消息分隔线
+                cleaned_message = re.sub(
+                    r"=+\n*=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\n*=+",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"=== 【重要】以下是当前新消息（请优先关注这条消息的核心内容）===",
+                    "",
+                    cleaned_message,
+                )
+                cleaned_message = re.sub(
+                    r"【禁止重复-你的历史回复】",
                     "",
                     cleaned_message,
                 )
@@ -2831,9 +2904,12 @@ class ContextManager:
         save_kind: str = "normal",
     ) -> bool:
         """
-        保存到官方对话系统，支持缓存转正
+        保存到官方对话系统 + 自定义存储，支持缓存转正
 
-        将缓存的未回复消息一起保存，避免上下文断裂
+        统一负责本次对话回合所有消息的持久化写入，确保官方存储和自定义存储
+        文件内追加顺序一致（缓存消息 → 用户消息 → AI 回复）。
+        调用方应将 save_user_message / save_bot_message 的 skip_custom_storage
+        设为 True，由本方法统一写入自定义存储，避免重复。
 
         Args:
             event: 消息事件
@@ -2841,6 +2917,7 @@ class ContextManager:
             user_message: 当前用户消息（原始，不带元数据）
             bot_message: AI回复
             context: Context对象
+            save_kind: 保存类型（"normal" 普通 / "poke_event" 戳一戳事件）
 
         Returns:
             是否成功

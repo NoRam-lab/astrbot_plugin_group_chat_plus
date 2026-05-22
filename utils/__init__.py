@@ -3,7 +3,7 @@
 导出所有工具类供主插件使用
 
 作者: Him666233
-版本: v1.2.2-hotfix.1
+版本: V1.2.3
 """
 
 from .probability_manager import ProbabilityManager

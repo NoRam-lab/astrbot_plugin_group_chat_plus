@@ -11,6 +11,8 @@
 ```
 群聊消息到达
     ↓
+Phase 0 · 空消息过滤（直接丢弃平台产生的真空消息，不进入任何后续流程）
+    ↓
 Phase 1 · 基础验证
     ↓
 Phase 2 · 消息增强
@@ -463,33 +465,55 @@ Phase 9 · 回复后处理（概率提升/打字延迟/错别字等）
 
 ### 工作原理
 
-AI 决策确认回复（Phase 7）后、实际调用 AI 生成回复（Phase 8）前，`SmartConcurrentManager` 尝试将**同期到达并通过 AI 决策**的其他消息合并进当前处理上下文：
+消息经过 Phase 5（内容处理）后、Phase 7（AI 决策判断）前，`SmartConcurrentManager` 按真实的 `arrival_seq` 到达顺序协调批次：
 
 ```
-消息A → AI决策通过 → 注册到待合并队列
-消息B → AI决策通过 → 注册到待合并队列
+消息A → 内容处理完成 → register_arrival + attach_payload
+消息B → 内容处理完成 → register_arrival + attach_payload
   ↓
-消息A 进入并发锁定、开始处理
+消息A（最小 arrival_seq）执行 claim_batch（快照，一次性的）
+  → 吸收消息B（payload_ready=True、非强制消息、未达批次上限）
+  → 消息B 标记为 consumed
+  → 消息B 的内容存入 _smart_batch_snapshots[A_id]（独立字典，非消息缓存）
   ↓
-Phase 7.5：消息A 尝试合并 → 发现消息B 在队列中
-  → 将消息B 标记为"已合并"
-  → 消息B 的内容追加至 window_buffered_messages 区域
-  → 消息B 的 cached_data 写入窗口缓冲缓存（Phase-2 保存路径）
-  → 重新生成包含消息B 的 formatted_context
+消息B 的处理协程：检测到 is_consumed=True → 跳过 DecisionAI → 返回
+  （消息B 的 cached_data 通过 anchor 的 _smart_batch_snapshots 保留，将在回复后一并保存）
   ↓
-消息B 的处理协程：检测到 is_merged=True → 跳过独立AI调用 → 返回
-  ↓
-Phase 8：AI 一次性感知消息A + 消息B 的内容，生成完整回复
+消息A 进入 Phase 7（DecisionAI）→ Phase 8（ReplyHandler）
+  → 两个 AI 均感知批次中所有消息（通过 format_context_for_ai(window_buffered_messages=...)）
 ```
+
+### 批次合并的双重上限
+
+数量上限和时间上限**同时启动、各自独立、谁先触发即停止**：
+
+| 上限类型 | 触发机制 | 默认值 | 说明 |
+|----------|----------|--------|------|
+| 数量上限 | `claim_batch` 吸收循环中计数达到即停 | 20 条（`smart_concurrent_max_batch_size`） | 剩余消息留在待合并池由下一批次处理 |
+| 时间上限 | `_cleanup_expired_locked` 清理超过时限的待合并消息 | 30 秒（`smart_concurrent_merge_wait`） | 超时消息转为独立处理 |
+| 强制消息边界 | `is_forced=True`（@消息/关键词触发）的吸收循环中 break | — | 批次边界，不被前一批次吞掉 |
+
+`claim_batch` 是一次性快照，不会持续等待收集更多消息。非强制消息在首次快照前有一个可配置的收拢延迟（`smart_concurrent_claim_delay`，默认 0.3 秒），用于给几乎同时到达的消息挂载 payload 的机会，减少"晚到 50ms 就被分到下一批"的情况。调用那一刻能吸收多少就吸收多少（受上限约束），收不完的留在待合并池给下一轮。
+
+### 被吸收消息的三种处理路径
+
+| 路径 | 场景 | 行为 |
+|------|------|------|
+| 决策前被吸收 | 消息在 Phase 7 前被 anchor 吸收 | 返回，内容通过 anchor 的 `_smart_batch_snapshots` 保留；anchor 回复后一并保存至存储 |
+| DecisionAI 判定不回复 | anchor 的 AI 判定不回复 | 被吸收的消息剥除特殊标记，转为普通消息缓存（与概率筛选失败的消息一致），等待后续转正 |
+| 决策后被吸收 | anchor 已通过 DecisionAI 但被更新的 anchor 吸收 | anchor 自身 + 其吸收的 followers 均转为普通消息缓存，等待后续转正 |
+
+被吸收的消息不会丢失——无论在哪种路径下，消息内容都会被保留（通过 anchor 的批次保存或普通消息缓存）。
 
 ### 与现有机制的关系
 
 | 机制 | 是否冲突 | 说明 |
 |------|---------|------|
-| 群聊等待窗口（GWW） | 不冲突 | GWW 在 Phase 6 拦截（AI 决策前）；Smart 合并在 Phase 7.5（AI 决策后）；两者处理不同场景 |
-| legacy 并发锁 | 不冲突 | Smart 模式下，被合并的消息检测到 `is_merged=True` 后直接返回，不再参与锁等待 |
+| 空消息过滤（Phase 0） | 不冲突 | 真空消息在入口处直接丢弃，不注册 arrival、不参与合并 |
+| 群聊等待窗口（GWW） | 不冲突 | GWW 在 Phase 6 拦截（AI 决策前）；Smart 合并在 Phase 5 后（AI 决策前）；两者处理不同场景 |
+| legacy 并发锁 | 不冲突/兜底 | Smart 模式下，被吸收的消息检测到 consumed 后直接返回；未被吸收的消息进入传统并发保护循环等待 |
 | 多用户消息 | 天然支持 | 合并区域格式含发送者名字和 ID，AI 可区分多人消息 |
-| 历史记录 | 完整保存 | 合并的消息以 `window_buffered=True` 写入缓存，经 Phase-2（`after_message_sent`）正常保存到历史 |
+| 历史记录 | 完整保存 | 合并的消息在 anchor 的 `after_message_sent` 中经 smart_batch_messages 转为普通格式（含元数据），正常保存至历史 |
 
 ### 相关配置
 
@@ -497,19 +521,17 @@ Phase 8：AI 一次性感知消息A + 消息B 的内容，生成完整回复
 |--------|------|
 | `concurrent_mode` | `legacy`（默认，向后兼容）或 `smart`（智能合并模式） |
 | `smart_concurrent_merge_wait` | 合并超时时间（秒），超时后未被合并的消息作为独立消息处理（默认 30 秒） |
-| `concurrent_wait_max_loops` | legacy 模式：最大等待循环次数 |
-| `concurrent_wait_interval` | legacy 模式：每次循环等待秒数 |
+| `smart_concurrent_max_batch_size` | 单批次最多吸收的消息数（默认 20，建议 1-50） |
+| `smart_concurrent_claim_delay` | 快照前收拢延迟（秒），给几乎同时到达的消息挂载 payload 的机会（默认 0.3，建议 0.1-0.5） |
+| `concurrent_wait_max_loops` | 通用并发等待的最大检测轮数（legacy 和 Smart 均复用） |
+| `concurrent_wait_interval` | 通用并发等待的每轮检测间隔（秒） |
 
 ### 7.5 Smart 并发批次回复提示（可选增强）
 
 当 `concurrent_mode=smart` 且 `enable_smart_batch_reply_hint=true` 时：
 - Smart 模式不仅会把当前消息后紧接着到达的追加消息一起注入上下文；
-- 回复阶段还会动态提示 AI：当前触发对象仍是本次的主要回复对象；
-- 如果批次里其他人的消息确实值得接，可以像真人一样自然顺带带一句；
-- 如果其他人的消息不值得回，可以忽略；
-- 不要机械逐条点名回答，也不要强行把所有人都回一遍。
-
-这项增强只影响“怎么组织这次回复”，不会改变读空气AI在 Phase 7 中的主体判断语义，也不会改写保存历史、注意力记录、最近明确回复对象等下游逻辑。动态提示会在保存前自动过滤，不会进入普通历史正文。
+- 回复阶段还会动态追加 `[系统提示-Smart并发]`，告知 AI：当前触发对象仍是主要回复对象，追加消息仅是背景参考，直接自然说话即可，不要进行任何判断或分析；
+- 该提示由 `MessageCleaner` 在保存前自动过滤（正则匹配 `[系统提示-Smart并发]` 整块），不会进入普通历史正文。
 
 ---
 
@@ -564,7 +586,7 @@ AI 决定要回复后，进入回复生成阶段。
 - 吸收后的 prompt 补充内容会进入一个固定的运行时兼容补充区，并为不同片段加上明显边界，避免不同插件提示词混在一起
 - 若仍无法高置信度识别，则进入**保守回退模式**：优先保留当前 `req.system_prompt`，并输出 warning 日志，但**不会中断回复流程**
 
-🆕 v1.2.2-hotfix.1：Hook 恢复完成后，会追加 `PLUGIN_CUSTOM_STATIC_INSTRUCTIONS` 中存储的静态系统指令到 `req.system_prompt` 末尾，提高 AI 服务商整块缓存命中率。`req.prompt` 中保留原静态前缀作为安全网。
+🆕 v1.2.3：Hook 恢复完成后，会追加 `PLUGIN_CUSTOM_STATIC_INSTRUCTIONS` 中存储的静态系统指令到 `req.system_prompt` 末尾，提高 AI 服务商整块缓存命中率。`req.prompt` 中保留原静态前缀作为安全网。
 
 因此：
 - 成功路径下，效果与旧版尽量保持一致
@@ -637,8 +659,8 @@ AI生成回复后，执行一系列后处理操作。
 
 **保存规则**：
 - 若 AI 回复后戳一戳动作真实成功，会在正常 AI 回复保存完成后，额外以 **assistant** 视角单独保存一条戳一戳历史事件
-- 若是收到 poke 后反戳成功，也会额外单独保存一条 assistant 视角历史事件
-- 这两条历史事件与 AI 正文回复分开保存，不拼接成同一条消息
+- 若是收到 poke 后反戳成功，会先后保存两条历史事件：先以 user 视角保存发起者的戳一戳事件，再以 assistant 视角保存 AI 反戳动作，均写入官方存储与自定义存储并绑定当前会话
+- 所有戳一戳历史事件与 AI 正文回复分开保存，不拼接成同一条消息
 
 ### 9.3 重复检测
 

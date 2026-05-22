@@ -398,7 +398,7 @@ const SessionMgr = {
                 <td>${(u.emotion||0).toFixed(2)}</td>
                 <td>${u.interaction_count||0}</td>
                 <td>${Utils.formatDuration(u.idle_seconds||0)}</td>
-                <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${Utils.escapeHtml(Utils.truncate(u.preview||'', 40))}</td>`;
+                <td><span style="display:block;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${Utils.escapeHtml(Utils.truncate(u.preview||'', 40))}</span></td>`;
             tbody.appendChild(tr);
         });
         table.appendChild(tbody);

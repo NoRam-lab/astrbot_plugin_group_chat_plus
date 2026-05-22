@@ -397,7 +397,7 @@ const App = {
                 tr.innerHTML = `
                     <td style="font-family:monospace;">${Utils.escapeHtml(ban.ip)}</td>
                     <td>${sourceBadge}</td>
-                    <td title="${displayReason}" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${displayReason}</td>
+                    <td><span title="${displayReason}" style="display:block;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${displayReason}</span></td>
                     <td>${Utils.formatTime(ban.banned_at)}</td>
                     <td>${remaining}</td>
                     <td>

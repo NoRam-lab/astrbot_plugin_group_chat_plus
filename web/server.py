@@ -2841,6 +2841,52 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}
             self.plugin.proactive_processing_sessions.pop(session, None)
             self.plugin.proactive_processing_sessions.pop(session_key, None)
 
+        # 清除待转存消息缓存（尝试多种 key 格式）
+        if hasattr(self.plugin, "pending_messages_cache"):
+            for key in {session, session_key, chat_id}:
+                if key and key in self.plugin.pending_messages_cache:
+                    del self.plugin.pending_messages_cache[key]
+                    cleared.append("pending_messages_cache")
+
+        # 清除最近回复缓存（尝试多种 key 格式）
+        if hasattr(self.plugin, "recent_replies_cache"):
+            for key in {session, session_key, chat_id}:
+                if key and key in self.plugin.recent_replies_cache:
+                    del self.plugin.recent_replies_cache[key]
+                    cleared.append("recent_replies")
+
+        # 清除等待窗口（key 为 (chat_id, user_id) 元组）
+        if hasattr(self.plugin, "_group_wait_windows"):
+            target_ids = {session, session_key}
+            if chat_id:
+                target_ids.add(chat_id)
+            stale_windows = [
+                wk
+                for wk, _ in self.plugin._group_wait_windows.items()
+                if isinstance(wk, tuple) and len(wk) >= 1 and str(wk[0]) in target_ids
+            ]
+            for wk in stale_windows:
+                self.plugin._group_wait_windows.pop(wk, None)
+            if stale_windows:
+                cleared.append("group_wait_windows")
+
+        # 清除对话活跃度映射
+        try:
+            from ..utils.attention_manager import AttentionManager
+
+            for key in {session, session_key}:
+                if key and key in AttentionManager._conversation_activity_map:
+                    del AttentionManager._conversation_activity_map[key]
+                    cleared.append("conversation_activity")
+                    break
+            for key in {session, session_key}:
+                if key and key in AttentionManager._fatigue_attention_block:
+                    del AttentionManager._fatigue_attention_block[key]
+                    cleared.append("fatigue_attention_block")
+                    break
+        except Exception:
+            pass
+
         return cleared
 
     async def _handle_session_list(self, request: web.Request):

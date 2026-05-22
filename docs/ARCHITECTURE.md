@@ -179,13 +179,25 @@ Web 文件管理 API 对以下敏感文件实施访问控制（返回 403）：
 
 在 `concurrent_mode=smart` 的基础上，如果同时开启 `enable_smart_batch_reply_hint`：
 
-- Smart 并发不仅会把“当前消息之后紧接着到达的追加消息”一起注入上下文；
+- Smart 并发不仅会把”当前消息之后紧接着到达的追加消息”一起注入上下文；
 - 回复阶段还会动态追加一段 `[系统提示-Smart并发]`；
-- 这段提示会明确告诉 AI：当前触发对象仍是主要回复对象，但可以像真人一样自然顺带回应批次中的其他消息；不值得回的消息也可以忽略；
-- 这项增强只影响“怎么组织这次回复”，不会改变读空气AI在决策阶段的主体判断，也不会改写保存历史、注意力记录、最近明确回复对象等下游逻辑；
+- 这段提示会明确告诉 AI：当前触发对象仍是主要回复对象，追加消息仅是背景参考，直接自然说话即可，不要进行任何判断或分析；
+- 这项增强只影响”怎么组织这次回复”，不会改变读空气AI在决策阶段的主体判断，也不会改写保存历史、注意力记录、最近明确回复对象等下游逻辑；
 - 该提示只存在于运行时 prompt 中，保存历史前会由 `MessageCleaner` 自动过滤，不会污染普通历史正文。
-- ⚠️ Smart 模式当前主要作用于普通消息批次合并与回复阶段提示增强；当主动对话正在占用某个会话时，普通链路在缓存转正/保存前的等待检测，仍然复用通用的 `concurrent_wait_max_loops` 与 `concurrent_wait_interval` 轮询参数，而不是切换成 Smart 专属等待逻辑。
-- ⚠️ 选择 `concurrent_mode=smart`，不代表传统并发保护会被关闭；更准确地说，普通对话主线会优先尝试 Smart 批处理，但底层传统并发等待与兜底保护仍然存在，用来处理主动对话占用、等待超时、以及 Smart 未覆盖的异常路径。
+
+### Smart 批次合并的双重上限 + 收拢延迟
+
+数量上限（`smart_concurrent_max_batch_size`，默认 20 条）和时间上限（`smart_concurrent_merge_wait`，默认 30 秒）同时启动、各自独立、谁先触发即停止合并。`claim_batch` 是一次性快照，不会持续等待收集更多消息。
+
+非强制消息在首次快照前有一个可配置的收拢延迟（`smart_concurrent_claim_delay`，默认 0.3 秒），用于给几乎同时到达的消息挂载 payload 的机会，减少"晚到几十毫秒就被分到下一批"的情况。强制消息（@/关键词）不等待，立即快照。
+
+被吸收的消息在三种路径下均不会丢失：
+- 决策前/claim阶段被吸收 → 内容通过 anchor 的 `_smart_batch_snapshots` 保留，anchor 回复后一并保存；
+- DecisionAI 判定不回复 → 剥除特殊标记，转为普通消息缓存；
+- 决策后被吸收 → anchor 自身及其 followers 均转为普通消息缓存。
+
+⚠️ Smart 模式当前主要作用于普通消息批次合并与回复阶段提示增强；当主动对话正在占用某个会话时，普通链路在缓存转正/保存前的等待检测，仍然复用通用的 `concurrent_wait_max_loops` 与 `concurrent_wait_interval` 轮询参数，而不是切换成 Smart 专属等待逻辑。
+⚠️ 选择 `concurrent_mode=smart`，不代表传统并发保护会被关闭；更准确地说，普通对话主线会优先尝试 Smart 批处理，但底层传统并发等待与兜底保护仍然存在，用来处理主动对话占用、等待超时、以及 Smart 未覆盖的异常路径。
 
 之所以不把“主回复对象”直接切换成批次中的其他人，是因为当前保存、注意力、冷却解除、最近明确回复对象等多处链路仍基于“本次主要回复对象 = 当前 event 发送者”的单主体假设。第一版保持这个假设不变，能以最小改动增强多人并发场景下的回复自然度，同时避免牵动无关逻辑。
 
@@ -277,9 +289,12 @@ AstrBot 平台默认的上下文构建是通用的——它把平台收到的历
 │  │  │   （新版 AstrBot）或回退到 system_prompt              │   │
 │  │  ↓                                                      │   │
 │  │  优先级 0       AstrBot 平台 LTM                        │   │
-│  │  ├─ 在 system_prompt 中追加群聊历史                     │   │
-│  │  │   "You are now in a chatroom..."                     │   │
-│  │  ├─ 填充 req.contexts = [平台对话上下文]               │   │
+│  │  │                                                   │   │
+│  │  │  【两种模式，取决于 enable_active_reply】          │   │
+│  │  │  Normal 模式 → system_prompt 末尾追加群聊历史     │   │
+│  │  │  Active Reply 模式 → req.prompt 中包裹历史        │   │
+│  │  │  格式: [昵称/HH:MM:SS]: 内容，条目间 \n---\n 分隔 │   │
+│  │  │  "You are now in a chatroom..."                   │   │
 │  │  ↓                                                      │   │
 │  │  优先级 -1      ★ 本插件的 on_llm_request ★           │   │
 │  │  ├─ 检查标记：是我的请求吗？→ 是！                     │   │
@@ -288,8 +303,11 @@ AstrBot 平台默认的上下文构建是通用的——它把平台收到的历
 │  │  ├─ SystemPromptRewriter 差分合并 system_prompt         │   │
 │  │  │   （保留 prefix=前置内容 + suffix=后置内容）        │   │
 │  │  ├─ 差分提取第三方 prompt 补充内容                      │   │
+│  │  │   同时对候选文本做 LTM 双重条件检测并丢弃           │   │
 │  │  ├─ 差分提取第三方 contexts 补充内容                    │   │
-│  │  ├─ 删除平台 LTM 注入的群聊历史                        │   │
+│  │  ├─ 剥离平台 LTM 注入的群聊历史                        │   │
+│  │  │   （system_prompt 路径: 精确条目格式匹配；           │   │
+│  │  │    prompt 路径: header+条目格式双重条件检测）       │   │
 │  │  ├─ ★ 用藏好的完整上下文替换 req.prompt ★             │   │
 │  │  │   + 合并第三方 prompt 补充（带边界标记）              │   │
 │  │  ├─ ★ 恢复 req.contexts = 插件策略值                  │   │
@@ -351,7 +369,7 @@ AstrBot 平台默认的上下文构建是通用的——它把平台收到的历
 ║  └─ extra 注入型回退路径（如 extra_user_content_parts        ║
 ║      不可用时走 system_prompt）                              ║
 ║                                                              ║
-║  [插件静态系统指令]（🆕 v1.2.2-hotfix.1）                               ║
+║  [插件静态系统指令]（🆕 v1.2.2-hotfix.1+）                               ║
 ║  ★ SYSTEM_REPLY_PROMPT 等大型静态行为指令                   ║
 ║  ★ 从 prompt 前端移入 system_prompt，提高缓存命中率          ║
 ║  ★ 对不支持缓存的 AI 行为无影响                              ║
@@ -404,10 +422,10 @@ AstrBot 平台默认的上下文构建是通用的——它把平台收到的历
 ║  [2026-03-13 周四 14:21:00] 张三(ID:111): 一起去公园吧       ║
 ║  【📦近期未回复】[2026-03-13 周四 14:25:00] 王五(ID:333): +1 ║
 ║                                                              ║
-║  ══════════════════════════════════════════════════           ║
-║  === 以上全部是历史消息，你已经处理过了 ===                  ║
-║  === 【重要】以下是当前新消息 ===                            ║
-║  ══════════════════════════════════════════════════           ║
+║  ════════════════════════════════════════════════════════════   ║
+║  === 以上全部是历史消息，你已经处理过了，不要重复回答 ===      ║
+║  === 【重要】以下是当前新消息（请优先关注这条消息的核心内容）===  ║
+║  ════════════════════════════════════════════════════════════   ║
 ║                                                              ║
 ║  [2026-03-13 周四 14:30:00] 张三(ID:111): 你们觉得去哪好？   ║
 ║  [系统提示]注意，现在有人在直接@你说话                       ║
@@ -449,7 +467,7 @@ AstrBot 平台默认的上下文构建是通用的——它把平台收到的历
 |------|-----------|-----------|
 | `req.prompt` 主体 | 用户发送的短消息 | 插件格式化的**完整上下文**（历史+指令+当前消息），再合并第三方 prompt 安全补充（带 `[第三方插件片段]` 边界标记） |
 | `req.contexts` 主体 | 平台对话历史数组 | 插件自己的 contexts 策略值（普通回复通常为空），再合并差分提取的第三方安全上下文（`req.contexts` 注入型插件的伪造对话、伪工具调用等，带 `[第三方插件注入上下文]` 分隔标记） |
-| 平台 LTM 群聊历史 | “You are now in a chatroom...” | **删除**（被插件自己的历史替代） |
+| 平台 LTM 群聊历史 | “You are now in a chatroom...”（注入到 system_prompt 或 prompt，取决于平台配置） | **删除**（system_prompt 路径：精确条目格式匹配剥离；prompt 路径：header + 条目格式双重条件检测过滤。两条路径覆盖两种注入模式，被插件自己的历史替代） |
 
 > 注意：这里说的是”主体语义被接管”。当前版本不再简单地把第三方对 `req.prompt` / `req.contexts` 的所有改写都一起抹掉；通过差分法识别出的安全长期注入增量，会通过 `_extract_third_party_prompt_additions()` 和 `_extract_third_party_context_additions()` 在恢复阶段追加回最终请求，并附上边界标记防止 AI 混淆不同插件的内容。
 
@@ -473,7 +491,7 @@ AstrBot 平台默认的上下文构建是通用的——它把平台收到的历
 | `extra_user_content_parts` 中的额外块 | 支持该字段的第三方插件 | 保持原样，不被本插件清空 |
 | 人格设定 | AstrBot 平台 | 作为 `system_prompt` 基础 |
 
-### 🆕 v1.2.2-hotfix.1 提示词缓存优化
+### 🆕 v1.2.2-hotfix.1+ 提示词缓存优化
 
 插件现已将大型静态系统指令（`SYSTEM_REPLY_PROMPT`、`SYSTEM_DECISION_PROMPT` 等）追加到 `system_prompt` 中，以提高 AI 服务商的整块缓存命中率。
 
@@ -485,7 +503,9 @@ AstrBot 平台默认的上下文构建是通用的——它把平台收到的历
 
 > 对不支持缓存的 AI 服务商：发送内容实质不变，仅位置调整，不影响 AI 理解。
 
-**保留机制的原理**：插件优先沿用旧版的“已知 persona prompt 精确命中 + 删除已知平台 LTM 片段”路径；若平台对 persona 包装或换行做了轻微调整，则退到轻量归一化识别；若仍无法高置信度识别，就进入**保守兼容模式**：优先保留当前 `req.system_prompt`，只在必要时补回插件 persona，并输出 warning 日志提醒可能存在重复提示词。对第三方写入 `req.prompt` / `req.contexts` 的内容，则不会直接原样全吞，而是先做“短消息基线 + 结构特征”安全识别：能确认是长期提示/记忆增量时才并回最终请求；无法确认时宁可跳过，也不把运行时脏内容混入 AI 输入。默认情况下，插件自己的 persona 仍然作为 `system_prompt` 基础放在前面，其他插件附加内容尽量完整保留在后面；这样既最大限度维持旧版效果，又能在未来 AstrBot/第三方插件提示词结构变化时优先保证**主回复链不断、其他插件内容尽量保留、问题可排查**。
+**保留机制的原理**：插件对平台 LTM 的剥离有两条独立路径覆盖两种注入模式——**system_prompt 路径**（Normal 模式）通过正则模式表精确匹配 LTM 条目格式剥离注入到 system_prompt 末尾的群聊历史；**prompt 路径**（Active Reply 模式）在差分提取第三方 prompt 补充时，对候选文本进行双重条件检测（必须同时命中 header 短语 + LTM 条目格式 `[昵称/HH:MM:SS]:`），满足条件即判定为平台 LTM 文本并丢弃。两个路径互为冗余：其一失效不导致另一失效。
+
+若平台对 persona 包装或换行做了轻微调整，则退到轻量归一化识别；若仍无法高置信度识别，就进入**保守兼容模式**：优先保留当前 `req.system_prompt`，只在必要时补回插件 persona，并输出 warning 日志提醒可能存在重复提示词。对第三方写入 `req.prompt` / `req.contexts` 的内容，则不会直接原样全吞，而是先做”短消息基线 + 结构特征”安全识别：能确认是长期提示/记忆增量时才并回最终请求；无法确认时宁可跳过，也不把运行时脏内容混入 AI 输入。默认情况下，插件自己的 persona 仍然作为 `system_prompt` 基础放在前面，其他插件附加内容尽量完整保留在后面；这样既最大限度维持旧版效果，又能在未来 AstrBot/第三方插件提示词结构变化时优先保证**主回复链不断、其他插件内容尽量保留、问题可排查**。
 
 ### system_prompt 兼容增强与保守回退机制
 
@@ -614,7 +634,7 @@ AstrBot 平台默认的上下文构建是通用的——它把平台收到的历
 
 ---
 
-## 并发处理机制（v1.2.2-hotfix.1+）
+## 并发处理机制（v1.2.2+）
 
 ### 两种并发处理模式
 
@@ -995,12 +1015,18 @@ SystemPromptRewriter 在合并 system_prompt 时有三种策略：
 
 #### 平台 LTM 格式变更的风险
 
-当前平台 LTM 的识别依赖正则模式表（匹配 `"You are now in a chatroom..."` 等已知格式）。如果 AstrBot 未来版本改写了这些注入文案：
+平台 LTM 的识别有两条独立路径，互为冗余：
+
+1. **system_prompt 路径**（Normal 模式）：通过 `SystemPromptRewriter._strip_known_ltm()` 的正则模式表精确匹配。Pattern 1 匹配 LTM 条目格式 `[昵称/HH:MM:SS]: 内容`（条目间以 `\n---\n` 分隔，使用 `(?!---\n)` 负向前瞻支持条目内多行消息），Pattern 2 匹配 Active Reply 完整格式（含 `Now, a new message is coming:` 等）。若两个正则均不命中，后续的降级策略（conservative-keep-current / conservative-prepend-plugin）会做兜底处理
+
+2. **prompt 路径**（Active Reply 模式）：通过 `_looks_like_known_runtime_text()` 的双重条件检测——必须同时命中 header 短语 `"You are now in a chatroom"` 且正则匹配到 LTM 条目格式 `[昵称/HH:MM:SS]:` 才判定为平台 LTM 文本。第三方插件内容无法同时满足这两条，不会被误过滤
+
+两条路径覆盖了 AstrBot 平台 LTM 的两种注入模式（`enable_active_reply=True/False`），无论平台切换哪种模式均有对应的剥离逻辑。如果 AstrBot 未来版本改写了注入文案：
 
 - **能匹配上** → 正常删除，避免与插件自建历史重复
-- **匹配不上** → 正则失效，平台 LTM 片段被保留（可能造成 system_prompt 中同时存在平台历史和插件历史）
+- **匹配不上** → 正则失效，平台 LTM 片段被保留（system_prompt 路径进入降级策略，prompt 路径回退到 `plugin_prompt` 子串匹配兜底）。两路径独立运作，单条失效不会导致另一条也失效
 
-> 这里的设计原则是**宁重复不缺漏**：删不掉平台历史最多让 AI 看到两份上下文（通常不影响回复质量），但误删第三方插件的注入会导致功能异常。
+> 这里的设计原则是**宁重复不缺漏**：删不掉平台历史最多让 AI 看到两份上下文（通常不影响回复质量），但误删第三方插件的注入会导致功能异常。两条路径均采用精确格式匹配（system_prompt 路径匹配条目结构，prompt 路径要求 header + 条目格式双重命中），确保第三方插件内容不被误伤。
 
 #### 流程图
 
@@ -1062,25 +1088,41 @@ on_llm_request Hook 执行链
                 └─ 不修改 prompt（extra 注入型主要通过 extra）
                     ↓
 优先级 0        AstrBot 平台 LTM（长期记忆）
-                ├─ 在 system_prompt 末尾追加：
-                │   "You are now in a chatroom.
-                │    The chat history is as follows:
-                │    [平台存储的群聊历史]"
-                ├─ 设置 req.contexts = [平台对话上下文]
-                └─ 不修改 prompt
+                │
+                │  【两种注入模式，取决于 enable_active_reply 配置】
+                │
+                ├─ Normal 模式（enable_active_reply=False）：
+                │   ├─ 在 system_prompt 末尾追加：
+                │   │   "You are now in a chatroom.
+                │   │    The chat history is as follows:
+                │   │    [平台存储的群聊历史，格式 [昵称/HH:MM:SS]: 内容]"
+                │   ├─ 设置 req.contexts = [平台对话上下文]
+                │   └─ 不修改 prompt
+                │
+                └─ Active Reply 模式（enable_active_reply=True）：
+                    ├─ 在 req.prompt 中包裹：
+                    │   "You are now in a chatroom. The chat history is as follows:
+                    │    [平台存储的群聊历史]
+                    │    Now, a new message is coming: `{用户消息}`.
+                    │    Please react to it. ..."
+                    ├─ 清空 req.contexts = []
+                    └─ 不修改 system_prompt
                     ↓
 优先级 -1       ★ 本插件 on_llm_request ★
                 │
                 │  此时 req.system_prompt 的内容可能接近：
-                │  "[人格] + [后置追加的内容] + [LTM 群聊历史]"
-                │  也可能因平台版本或第三方插件包装差异出现轻微变化
+                │  "[人格] + [后置追加的内容] + [LTM 群聊历史]（Normal 模式下）"
+                │  req.prompt 在 Active Reply 模式下已被 LTM 包裹
+                │  具体结构可能因平台版本或第三方插件包装差异出现轻微变化
                 │
                 ├─ 1. 优先尝试精确命中插件自己的人格 prompt
                 │
                 ├─ 2. 若精确命中失败，再尝试轻量兼容识别
                 │     （如 `# Persona Instructions` 包装 + 空白归一化）
                 │
-                ├─ 3. 对已知平台 LTM 片段做模式表清理
+                ├─ 3. 对已知平台 LTM 片段做模式表清理（system_prompt 路径）
+                │     使用精确条目格式匹配（[昵称/HH:MM:SS]: 内容），
+                │     以 (?!---\n) 负向前瞻支持多行消息，不跨越条目边界
                 │     （成功时移除，避免与插件自建历史重复）
                 │
                 ├─ 4. 若仍无法高置信度识别
@@ -1089,6 +1131,10 @@ on_llm_request Hook 执行链
                 │     → 输出 warning，不中断主回复链
                 │
                 ├─ 5. 基于短消息基线尝试吸收第三方 prompt 长期补充
+                │     同时进行平台 LTM 检测（prompt 路径）：
+                │     候选文本若同时命中 header 短语 + LTM 条目格式
+                │     （[昵称/HH:MM:SS]:）则判定为平台 LTM 文本并丢弃；
+                │     第三方插件内容不满足此双重条件，不会被误过滤
                 │     （只保留安全增量，不直接原样继承整段 prompt）
                 │
                 ├─ 6. 基于结构特征尝试保留第三方长期 contexts
@@ -1105,9 +1151,9 @@ on_llm_request Hook 执行链
 ═════════════════════════════════════════════════
 最终结果：
   system_prompt = [前置注入的内容] + 插件人格 + [后置注入的内容] + [prompt/contexts 注入的内容]
-                  + 静态指令 + Skills + TOOL_CALL_PROMPT（正常路径下已去掉已知 LTM）
+                  + 静态指令 + Skills + TOOL_CALL_PROMPT（正常路径下 LTM 已被剥离，两条路径互为冗余覆盖两种注入模式）
   prompt        = 插件格式化的完整上下文 + 安全识别出的第三方 prompt 补充
-                  （带 [第三方插件片段 N] 边界标记）
+                  （带 [第三方插件片段 N] 边界标记，平台 LTM 文本已被双重条件检测过滤）
   contexts      = 插件既有策略值 + 安全识别出的第三方长期上下文
                   （带 [第三方插件注入上下文] 分隔标记）
   extra_user_content_parts = 原样保留（extra 注入型插件内容不受影响）

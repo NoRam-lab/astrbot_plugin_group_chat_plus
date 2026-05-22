@@ -141,6 +141,9 @@ class SmartConcurrentManager:
             logger.warning(f"[SmartConcurrent] has_earlier_pending 失败: {e}")
             return False
 
+    # 单批次最多吸收的消息数（防止极端并发下上下文溢出）
+    _MAX_BATCH_SIZE: int = 20
+
     @classmethod
     async def claim_batch(cls, chat_id: str, processing_id: str) -> dict:
         """
@@ -201,6 +204,10 @@ class SmartConcurrentManager:
                     entry_pid = entry.get("processing_id")
                     if not entry_pid or entry_pid == processing_id:
                         continue
+
+                    # 达到批次上限：停止吸收，剩余消息留在 pending 由下一批次处理
+                    if len(merged_entries) >= cls._MAX_BATCH_SIZE:
+                        break
 
                     # 后续强制消息永远作为新的边界，不被前一个批次吞掉
                     if entry.get("is_forced", False):
