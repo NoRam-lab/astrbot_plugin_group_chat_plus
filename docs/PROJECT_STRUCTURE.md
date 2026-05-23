@@ -117,7 +117,7 @@ astrbot_plugin_group_chat_plus/
 
 ### metadata.yaml — 插件元数据
 
-定义插件名称、版本号（v1.2.3）、作者、描述、AstrBot 最低版本要求等。AstrBot 平台通过此文件识别和管理插件。
+定义插件名称、版本号（V1.2.3.hotfix.1）、作者、描述、AstrBot 最低版本要求等。AstrBot 平台通过此文件识别和管理插件。
 
 ### _conf_schema.json — 配置定义
 

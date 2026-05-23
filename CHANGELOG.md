@@ -1,8 +1,22 @@
 ## 📝 更新日志
 
-### v1.2.3 (2026-05-22)
+### V1.2.3.hotfix.1 (2026-05-23)
 
-**Smart 并发可靠性修复 + 上下文清洗精准化 + 戳一戳消息保存修复 + Web 面板空白会话修复与浏览器兼容性增强 + 判断型 AI 推理日志优化 + 概率日志修复 + 文档全面更新**
+**AI 回复纲领行动导向重写（杜绝判断文本泄露）+ 内容过滤配置说明补充 + Smart 并发可靠性修复 + 上下文清洗精准化 + 戳一戳消息保存修复 + Web 面板空白会话修复与浏览器兼容性增强 + 判断型 AI 推理日志优化 + 概率日志修复 + 文档全面更新**
+
+**🧠 AI 回复纲领行动导向重写（杜绝判断文本泄露）**:
+- **群聊回复 AI 提示词重写** — 将 `reply_handler.py` 的 `SYSTEM_REPLY_PROMPT` 从原先包含"只回复""不应回复"等严格规则和负面示例的判断型措辞，彻底重写为行动导向纲领：首句改为"你的任务：直接生成回复内容。系统已将消息交给你处理，你无需考虑'该不该回复'或'该不该开口'——这些判断已经完成。"，核心原则精简为"你只负责生成回复文本，不负责判断、不负责分析、不负责解释为什么回复或不回复"，新增"回复身份"专节列出所有应避免的内部判断/过渡句式（"是否该回复""现在该不该开口""我决定这么说""我先想一下"等），并明确指示"如果你脑中有判断、犹豫、筛选、改写、取舍，这些都只能停留在内部，不要写出来"。去除原有冗长的负面示例列表，改为正面引导式的行动说明
+- **私聊回复 AI 提示词同步重写** — `private_chat_reply_handler.py` 的 `SYSTEM_REPLY_PROMPT` 同步重写为行动导向：首句改为"你的任务：直接生成回复内容。系统已将消息交给你处理，你无需考虑'该不该回复'——这些判断已经完成。"，核心原则同步精简，与群聊回复 AI 保持一致的防泄露语义
+- **主动对话生成 AI 提示词重写** — `proactive_chat_manager.py` 的 `default_proactive_prompt` 重写为行动导向：首句改为"你的任务：直接生成你要说的话。系统已经完成了'现在适不适合主动开口'的判断，你无需再考虑该不该说话。你只需根据上下文自然地发起话题：可以延续最近的讨论，可以回应未回复的消息，也可以开启全新话题。无论选择哪个方向，直接说出来就好，不要解释你的选择。"，新增"不要输出判断腔"和"不要外显内部取舍过程"两条核心要求，去除原有冗余的禁止列表，改为简洁的行动引导
+- **Web 端提示词预览同步** — `prompt-data.js` 中读空气 AI、回复 AI、主动对话 AI 三处默认提示词预览内容同步更新为行动导向版本，与后端实际使用的提示词保持一致，Web 面板用户看到的预览即实际生效内容
+- **彻底杜绝判断文本泄露** — 三种回复 AI（群聊/私信/主动对话）的提示词现在均以"你的任务：直接生成..."开头，从第一条指令就建立行动框架。AI 不再看到"判断是否回复""决定要不要说话"等判断型措辞，因此不会在输出中残留"我觉得现在不适合开口""我应该回复这条"等内部决策语言，从源头杜绝判断文本泄露到用户可见的回复中
+
+**📝 内容过滤配置说明全面补充**:
+- **规则执行顺序说明** — `_conf_schema.json` 中 `output_content_filter_rules` 和 `save_content_filter_rules` 的 hint 新增规则执行顺序说明：规则按列表顺序逐条执行，后一条在前一条的结果上继续过滤，规则顺序会影响最终效果；建议将 Head/Tail 等大范围规则放在前面，精细的 Range 规则放在后面
+- **三种模式匹配行为差异** — 补充三种过滤模式的精确行为差异说明：① 范围过滤（`A*B`）循环匹配直到文本中再无匹配，可清除所有出现的标记块；② 头部过滤（`{{>*B`）仅匹配第一个结束标记 B，不循环；③ 尾部过滤（`A*>}}`）仅匹配第一个开始标记 A，不循环。明确标注各模式的循环/单次行为差异
+- **输出/保存过滤适用范围** — 在 `_content_filter_section_header`、`enable_output_content_filter`、`enable_save_content_filter` 三处的 hint 中明确注明：输出过滤和保存过滤的开关对「普通回复」和「主动对话生成」两条路径同时生效，共用同一套过滤规则和同一个过滤器实例，没有单独的路径开关。主动对话的回复在发送前和保存前同样经过这两道过滤
+- **典型场景建议** — `save_content_filter_rules` 的 hint 新增典型使用场景指引：输出保留思考过程、保存时过滤 → 只在 save 规则配置；输出过滤思考过程、保存时保留 → 只在 output 规则配置；两者都过滤 → 两套规则各自配置
+- **内容过滤模块文档注释补充** — `content_filter.py` 模块头部注释补充了过滤适用范围的说明，明确输出过滤控制 AI 发送给用户看的内容、保存过滤控制 AI 写入历史记录的内容，两套规则完全独立互不影响
 
 **🔄 Smart 并发可靠性修复**:
 - **被吸收消息存储丢失修复** — 修复 Smart 并发模式下，被 anchor 吸收的 follower 消息在特定路径（尤其是 anchor 自身也被更高优先级的消息吸收时）中存储引用丢失的问题，确保所有被吸收的消息都能在批次回复后正确写入历史存储，不再出现"消息明明被AI看到了但历史里找不到"的情况
@@ -35,7 +49,7 @@
 - **概率计算日志准确性修复** — 修复了概率计算链路中若干日志输出的值不准确的问题：部分中间步骤的日志在打印概率值时使用了缓存变量而非实时计算值，导致日志显示的"当前概率"与实际用于判断的概率不一致（判断本身使用正确值，仅日志显示有误）。修复后所有日志输出的概率值均与实际决策用值保持一致，方便调试和调参
 
 **📚 文档全面补充与更新**:
-- **全部说明文档更新** — 更新了项目中所有说明文档的版本号、功能描述和配置说明，确保与 v1.2.3 版本的实际功能保持一致
+- **全部说明文档更新** — 更新了项目中所有说明文档的版本号、功能描述和配置说明，确保与 V1.2.3.hotfix.1 版本的实际功能保持一致
 - **配置项文档补充** — `CONFIG_REFERENCE.md` 新增了 `smart_concurrent_claim_delay` 等新配置项的完整说明
 - **消息工作流程文档更新** — `MESSAGE_WORKFLOW.md` 补充了 Smart 并发快照前实停延迟的流程说明
 - **桌面端兼容文档更新** — `DESKTOP_COMPATIBILITY.md` 更新了版本兼容性表格
@@ -43,13 +57,17 @@
 - **深度指南文档更新** — `ARCHITECTURE.md` 更新了相关的机制说明和版本引用
 
 **修改文件**:
+- `utils/reply_handler.py` — AI 回复纲领重写为行动导向（去除严格规则和负面示例，杜绝判断文本泄露），Smart 并发提示词调整，批次回复提示防判断泄露
+- `utils/proactive_chat_manager.py` — 主动对话 AI 回复纲领重写为行动导向，判断型 AI 推理日志优化
+- `utils/decision_ai.py` — 判断型 AI 提示词语义优化，推理日志优化（未生效时 WARNING 提示 + 来源标签）
+- `private_chat/private_chat_utils/private_chat_reply_handler.py` — 私聊 AI 回复纲领同步重写为行动导向
+- `utils/content_filter.py` — 模块文档注释补充过滤适用范围说明
+- `web/static/js/prompt-data.js` — Web 端提示词预览同步更新为行动导向版本
+- `_conf_schema.json` — 内容过滤配置 hint 全面补充（规则执行顺序、三种模式匹配行为差异、输出/保存过滤适用范围说明），新增 `smart_concurrent_claim_delay` 配置项
 - `utils/smart_concurrent_manager.py` — Smart 并发被吸收消息存储丢失修复，空消息入口过滤，批次双上限加固，快照前实停延迟
 - `utils/system_prompt_rewriter.py` — 平台提示词清洗精度提升（system_prompt 路径条目格式精确匹配 + prompt 路径双重条件检测）
 - `utils/message_cleaner.py` — 新增 Smart 批次提示泄露兜底过滤规则
-- `utils/reply_handler.py` — Smart 并发提示词调整，批次回复提示防判断泄露
-- `utils/decision_ai.py` — 判断型 AI 推理日志优化（未生效时 WARNING 提示 + 来源标签）
 - `utils/frequency_adjuster.py` — 频率判断 AI 推理日志优化
-- `utils/proactive_chat_manager.py` — 主动对话判断 AI 推理日志优化
 - `utils/probability_manager.py` — 概率计算日志准确性修复
 - `main.py` — 戳一戳消息保存修复，新增 `smart_concurrent_claim_delay` 配置项读取，Smart 并发重置范围补充
 - `web/server.py` — Web 面板空白会话修复（空数据保护层），重置指令覆盖范围补充
@@ -59,16 +77,15 @@
 - `web/static/js/tech-tree.js` — 浏览器兼容性 polyfill
 - `web/static/js/session-mgr.js` — 空白会话保护层
 - `web/static/css/main.css` — 跨浏览器 CSS 兼容性（dvh fallback、backdrop-filter 降级、-webkit- 前缀补充）
-- `_conf_schema.json` — 新增 `smart_concurrent_claim_delay` 配置项
-- `metadata.yaml` — 更新版本号到 v1.2.3，更新插件简介
+- `metadata.yaml` — 更新版本号到 V1.2.3.hotfix.1，更新插件简介
 - `README.md` — 更新版本号、更新亮点和更新日志
-- `CHANGELOG.md` — 新增 v1.2.3 版本更新记录
+- `CHANGELOG.md` — 更新为 V1.2.3.hotfix.1 版本更新记录
 - `docs/ARCHITECTURE.md` — 更新版本引用和机制说明
-- `docs/CONFIG_REFERENCE.md` — 新增 Smart 快照前实停延迟配置项说明
+- `docs/CONFIG_REFERENCE.md` — 新增 Smart 快照前实停延迟配置项说明，补充内容过滤配置说明
 - `docs/MESSAGE_WORKFLOW.md` — 补充 Smart 并发快照前实停延迟流程说明
 - `docs/PROJECT_STRUCTURE.md` — 更新模块列表和版本信息
 - `docs/DESKTOP_COMPATIBILITY.md` — 更新版本兼容性表格
-- 所有 Python 模块 — 统一更新文件头版本号到 v1.2.3
+- 所有 Python 模块 — 统一更新文件头版本号到 V1.2.3.hotfix.1
 
 ---
 
