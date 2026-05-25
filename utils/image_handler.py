@@ -1,37 +1,43 @@
-"""
-图片处理器模块
-负责处理消息中的图片，包括检测、过滤和转文字
+"""Image handling and image importance gating."""
 
-作者: Him666233
-版本: V1.2.3.hotfix.1
-"""
+from __future__ import annotations
 
 import asyncio
-from typing import List, Optional, Tuple, Any
-from astrbot.api.all import *
-from astrbot.api.message_components import Face, At, AtAll, Reply
-from .image_description_cache import ImageDescriptionCache
-from .ai_error_formatter import format_ai_error
+import json
+import re
+import time
+from typing import List, Optional, Tuple
 
-# 详细日志开关（与 main.py 同款方式：单独用 if 控制）
+from astrbot.api.all import *
+from astrbot.api.message_components import At, Face, Reply
+
+from .image_description_cache import ImageDescriptionCache
+from .image_gate_prompt import (
+    build_image_context_hint as _build_image_context_hint_impl,
+    build_structured_prompt as _build_structured_prompt_impl,
+    build_structured_system_prompt as _build_structured_system_prompt_impl,
+    compact_context_text as _compact_context_text_impl,
+)
+from .image_importance_policy import ImageImportancePolicy, POLICY_VERSION
+from .image_spam_gate import ImageSpamDecision, ImageSpamGate
+
+
 DEBUG_MODE: bool = False
+
+DEFAULT_IMAGE_TO_TEXT_SYSTEM_PROMPT = (
+    "你是图片结构化解析器，只负责把输入图片转换为严格 JSON。\n"
+    "只能输出一个 JSON 对象，不要输出 Markdown、代码块、解释、寒暄或任何额外文本。\n"
+    'JSON 字段只能包含: {"description":"中文图片描述","importance":0.0}\n'
+    "description 必须是中文字符串，需要说明图片的表面内容、可能的梗/隐含含义和群聊理解所需信息。\n"
+    "importance 必须是 0 到 1 的数字，表示这张图片对后续群聊上下文的必要程度："
+    "0 表示几乎没有保留价值，1 表示强烈需要保留。\n"
+    "只根据当前图片和提供的局部上下文评分；如果局部上下文出现 [上文图片]、[上文连续图片×N] "
+    "或 [近期群内图片较多，前文图片已压缩]，只把它当作刷图背景信号，不要推断那些图片的具体内容。"
+)
 
 
 class ImageHandler:
-    """
-    图片处理器
-
-    主要功能：
-    1. 检测消息中的图片
-    2. 过滤纯图片消息或移除图片
-    3. 调用AI将图片转为文字描述
-    4. 将描述融入原消息
-    """
-
-    @staticmethod
-    def _coerce_plain_text(value: Any) -> str:
-        """兼容某些平台 Plain.text=None 的情况。"""
-        return value if isinstance(value, str) else ""
+    """Handle image extraction, vision calls, and prompt gating."""
 
     @staticmethod
     async def process_message_images(
@@ -46,147 +52,127 @@ class ImageHandler:
         timeout: int = 60,
         image_description_cache: Optional[ImageDescriptionCache] = None,
         max_images_per_message: int = 10,
-    ) -> Tuple[bool, str, List[str], bool]:
-        """
-        处理消息中的图片
-
-        Args:
-            event: 消息事件
-            context: Context对象
-            enable_image_processing: 是否启用图片处理
-            image_to_text_scope: 应用范围（all/mention_only/at_only/keyword_only）
-            image_to_text_provider_id: 图片转文字AI提供商ID
-            image_to_text_prompt: 转换提示词
-            is_at_message: 是否@消息
-            has_trigger_keyword: 是否包含触发关键词
-            timeout: 图片转文字超时时间（秒）
-            image_description_cache: 图片描述缓存实例（可选，用于省钱）
-            max_images_per_message: 单条消息最大处理图片数
-
-        Returns:
-            (是否继续处理, 处理后的消息, 图片URL列表, 图片是否保留)
-            - True=继续，False=丢弃
-            - 图片URL列表：用于多模态AI直接处理
-            - 图片是否保留：True=图片信息仍在消息中（作为URL或文字描述），False=图片已被移除/过滤
-        """
+        image_importance_policy: Optional[ImageImportancePolicy] = None,
+        image_spam_gate: Optional[ImageSpamGate] = None,
+        image_to_text_system_prompt: str = "",
+        skip_active_image_understanding: bool = False,
+    ) -> Tuple[bool, str, List[str], bool, List[dict]]:
         try:
-            # 获取消息链
             if not hasattr(event, "message_obj") or not hasattr(
                 event.message_obj, "message"
             ):
-                # 没有消息链,使用原始文本
-                return True, event.get_message_outline(), [], False
+                return True, event.get_message_outline(), [], False, []
 
             message_chain = event.message_obj.message
-
-            # 检查消息中是否有图片
             has_image, has_text, image_components = ImageHandler._analyze_message(
                 message_chain, max_images_per_message
             )
+            has_reply_component = any(isinstance(component, Reply) for component in message_chain)
 
-            # 如果没有图片，从消息链提取完整文本（含引用内容），不使用 get_message_outline()
-            # 因为 get_message_outline() 通常不包含引用消息（Reply 组件）的内容
             if not has_image:
                 text_content = ImageHandler._extract_text_only(message_chain)
                 if not text_content:
-                    # 兜底：message chain 提取为空时才使用 get_message_outline()
                     text_content = event.get_message_outline()
-                return True, text_content, [], False
+                return True, text_content, [], False, []
 
             if DEBUG_MODE:
                 logger.info(
-                    f"检测到消息包含 {len(image_components)} 张图片, 是否有文字: {has_text}"
+                    "检测到消息包含 %d 张图片, 文本? %s",
+                    len(image_components),
+                    has_text,
                 )
 
-            # === 第一步：检查图片处理开关 ===
-            # 如果不启用图片处理，所有带图片的消息都要过滤（不管是什么模式）
             if not enable_image_processing:
-                if DEBUG_MODE:
-                    logger.info("图片处理未启用,过滤所有图片")
-                # 如果是纯图片消息,丢弃
                 if not has_text:
-                    if DEBUG_MODE:
-                        logger.info("检测到纯图片消息,但图片处理未启用,丢弃该消息")
-                    return False, "", [], False
-                else:
-                    # 如果是图文混合,移除图片只保留文字
-                    text_only = ImageHandler._extract_text_only(message_chain)
-                    if DEBUG_MODE:
-                        logger.info(f"移除图片后的消息: {text_only}")
-                    return True, text_only, [], False
+                    return False, "", [], False, []
+                return True, ImageHandler._extract_text_only(message_chain), [], False, []
 
-            # === 第二步：根据应用范围(image_to_text_scope)决定是否对当前消息启用图片转文字 ===
-            scope = (image_to_text_scope or "all").strip().lower()
-            should_apply_image_to_text = True
+            chat_key = ImageHandler._event_chat_key(event)
+            sender_id = ImageHandler._event_sender_id(event)
 
-            # 🔍 调试日志：始终输出scope判断信息，便于排查问题
-            logger.info(
-                f"🖼️ [图片范围检查] scope={scope}, is_at_message={is_at_message}, has_trigger_keyword={has_trigger_keyword}"
-            )
-
-            if scope == "all":
-                should_apply_image_to_text = True
-            elif scope == "mention_only":
-                # 兼容旧逻辑：@消息或包含触发关键词的消息都视为适用
-                should_apply_image_to_text = is_at_message or has_trigger_keyword
-            elif scope == "at_only":
-                # 仅对真正的@机器人消息启用图片转文字
-                should_apply_image_to_text = is_at_message
-            elif scope == "keyword_only":
-                # 仅对包含触发关键词的消息启用图片转文字
-                should_apply_image_to_text = has_trigger_keyword
-            else:
-                # 未知配置值时，退回到与mention_only一致的行为
-                should_apply_image_to_text = is_at_message or has_trigger_keyword
-
-            # 🔍 调试日志：输出最终判断结果
-            logger.info(
-                f"🖼️ [图片范围判断] should_apply_image_to_text={should_apply_image_to_text}"
-            )
-
-            if not should_apply_image_to_text:
-                if DEBUG_MODE:
-                    logger.info(
-                        f"图片转文字应用范围为{scope}, 当前消息不符合范围, 过滤图片"
-                    )
-                # 如果是纯图片消息,丢弃
-                if not has_text:
-                    if DEBUG_MODE:
-                        logger.info("非适用范围内的纯图片消息,丢弃该消息")
-                    return False, "", [], False
-                else:
-                    # 如果是图文混合,移除图片只保留文字
-                    text_only = ImageHandler._extract_text_only(message_chain)
-                    if DEBUG_MODE:
-                        logger.info(
-                            f"非适用范围内的图文混合,移除图片保留文字: {text_only}"
-                        )
-                    return True, text_only, [], False
-
-            # === 第三步：启用了图片处理，根据是否配置图片转文字ID决定处理方式 ===
-            if DEBUG_MODE:
-                logger.info("图片处理已启用")
-
-            # 如果没有填写图片转文字的提供商ID,说明使用多模态AI,提取图片URL传递
-            if not image_to_text_provider_id:
-                if DEBUG_MODE:
-                    logger.info("未配置图片转文字提供商ID,提取图片URL传递给多模态AI")
-                # 提取图片URL
-                image_urls = await ImageHandler._extract_image_urls(image_components)
-                # 提取文本内容（不包含图片）
-                text_content = ImageHandler._extract_text_only(message_chain)
-                if DEBUG_MODE:
-                    logger.info(
-                        f"🟢 [多模态模式] 提取到 {len(image_urls)} 张图片，文本内容: {text_content[:100] if text_content else '(无文本)'}"
-                    )
-                return True, text_content, image_urls, True  # 多模态: 图片保留为URL
-
-            # === 第四步：配置了图片转文字提供商ID，尝试转换图片 ===
-            if DEBUG_MODE:
-                logger.info(
-                    f"已配置图片转文字提供商ID,尝试转换图片(超时时间: {timeout}秒)"
+            if skip_active_image_understanding:
+                image_statuses = await ImageHandler._build_pending_image_statuses(
+                    image_components,
+                    "active_image_blacklist",
                 )
-            processed_message = await ImageHandler._convert_images_to_text(
+                return (
+                    True,
+                    ImageHandler._build_placeholder_message_text(message_chain),
+                    [],
+                    False,
+                    image_statuses,
+                )
+
+            burst_factor = 1.0
+            if image_importance_policy:
+                burst_factor = image_importance_policy.register_image_batch(
+                    chat_key=chat_key,
+                    image_count=len(image_components),
+                    timestamp=time.time(),
+                )
+            batch_factor = (
+                image_importance_policy.batch_factor(len(image_components))
+                if image_importance_policy
+                else 1.0
+            )
+            spam_decision = ImageHandler._evaluate_spam_gate(
+                image_spam_gate,
+                chat_key=chat_key,
+                sender_id=sender_id,
+                image_count=len(image_components),
+                batch_factor=batch_factor,
+                burst_factor=burst_factor,
+                quoted=has_reply_component,
+            )
+            if spam_decision and spam_decision.skip:
+                image_statuses = []
+                for idx, img_component in enumerate(image_components):
+                    try:
+                        image_ref = await img_component.convert_to_file_path()
+                    except Exception:
+                        image_ref = ""
+                    image_statuses.append(
+                        {
+                            "index": idx,
+                            "image_ref": image_ref or "",
+                            "status": "skipped_spam_batch",
+                            "description": "",
+                            "failure_reason": spam_decision.reason,
+                            "importance": 0.0,
+                            "effective_importance": 0.0,
+                            "time_factor": 1.0,
+                            "burst_factor": burst_factor,
+                            "batch_factor": batch_factor,
+                            "threshold": 0.0,
+                            "keep": False,
+                            "gate_reason": spam_decision.reason,
+                            "policy_version": "image_spam_gate_v1",
+                        }
+                    )
+                return True, ImageHandler._build_placeholder_message_text(message_chain), [], False, image_statuses
+
+            # image_to_text_scope is kept for compatibility only.
+            if not image_to_text_provider_id:
+                image_urls = await ImageHandler._extract_image_urls(image_components)
+                image_statuses = [
+                    {
+                        "index": idx,
+                        "image_ref": url,
+                        "status": "multimodal_url",
+                        "description": "",
+                        "failure_reason": "",
+                        "importance": 1.0,
+                        "effective_importance": 1.0,
+                        "keep": True,
+                        "gate_reason": "multimodal_url",
+                        "policy_version": POLICY_VERSION,
+                    }
+                    for idx, url in enumerate(image_urls)
+                ]
+                text_content = ImageHandler._extract_text_only(message_chain)
+                return True, text_content, image_urls, True, image_statuses
+
+            processed_message, image_statuses = await ImageHandler._convert_images_to_text(
                 message_chain,
                 context,
                 image_to_text_provider_id,
@@ -194,88 +180,60 @@ class ImageHandler:
                 image_components,
                 timeout,
                 image_description_cache,
-                getattr(event, "session_id", ""),
+                image_importance_policy,
+                chat_key,
+                sender_id,
+                image_spam_gate,
+                image_to_text_system_prompt,
             )
 
-            # 如果转换失败或超时,进行降级处理（过滤图片）
             if processed_message is None:
-                logger.warning("图片转文字超时或失败,进行过滤处理")
-                # 纯图片（无文字、无引用）且转换失败：不丢弃，用占位符替代每张图片
-                # 仅在用户填写了转换服务商ID（真实转换模式）时才会走到这里
                 if not has_text:
                     fallback_parts = []
                     for comp in message_chain:
                         if isinstance(comp, Image):
-                            fallback_parts.append("[图片（识别失败）]")
+                            fallback_parts.append("[图片(识别失败)]")
                         else:
                             fmt = ImageHandler._format_special_component(comp)
                             if fmt:
                                 fallback_parts.append(fmt)
-                    fallback_text = (
-                        "".join(fallback_parts).strip() or "[图片（识别失败）]"
-                    )
-                    logger.warning(
-                        f"纯图片消息转换失败，使用占位文字替代: {fallback_text}"
-                    )
-                    return True, fallback_text, [], False
-                else:
-                    # 如果是图文混合,只保留文字
-                    text_only = ImageHandler._extract_text_only(message_chain)
-                    if DEBUG_MODE:
-                        logger.info(f"降级处理: 移除图片,保留文字: {text_only}")
-                    return True, text_only, [], False  # 图片转文字失败，图片被移除
+                    fallback_text = "".join(fallback_parts).strip() or "[图片(识别失败)]"
+                    return True, fallback_text, [], False, image_statuses
+                return True, ImageHandler._extract_text_only(message_chain), [], False, image_statuses
 
-            # 转换成功，返回转换后的消息（图片已转成文字描述）
-            if DEBUG_MODE:
-                logger.info(f"🔴 [图片转文字成功] 结果: {processed_message[:150]}")
-            return (
-                True,
-                processed_message,
-                [],
-                True,
-            )  # 图片转文字成功: 图片信息保留为文字描述
+            return True, processed_message, [], any(
+                bool(item.get("keep")) for item in image_statuses or []
+            ), image_statuses
 
-        except Exception as e:
-            logger.error(f"处理消息图片时发生错误: {e}")
-            # 发生错误时,返回原消息文本
-            return True, event.get_message_outline(), [], False
+        except Exception as exc:
+            logger.error("处理消息图片时发生错误: %s", exc)
+            return True, event.get_message_outline(), [], False, []
 
     @staticmethod
     def _analyze_message(
         message_chain: List[BaseMessageComponent],
         max_images: int = 10,
     ) -> Tuple[bool, bool, List[Image]]:
-        """
-        分析消息链，检查图片和文字
-
-        Args:
-            message_chain: 消息链
-            max_images: 单条消息最大处理图片数
-
-        Returns:
-            (是否有图片, 是否有文字, 图片组件列表)
-        """
         has_image = False
         has_text = False
-        image_components = []
+        image_components: List[Image] = []
 
         for component in message_chain:
             if isinstance(component, Image):
                 has_image = True
                 image_components.append(component)
             elif isinstance(component, Plain):
-                # 检查是否有非空白文字
-                if ImageHandler._coerce_plain_text(component.text).strip():
+                if component.text and component.text.strip():
                     has_text = True
             elif isinstance(component, Reply):
-                # 引用消息也视为有文字内容，防止「引用+图片」的消息被当作纯图片丢弃
                 has_text = True
 
-        # 限制单条消息处理的图片数量，防止恶意刷图
         if len(image_components) > max_images:
             logger.warning(
-                f"[图片处理] 单条消息包含 {len(image_components)} 张图片，"
-                f"超过上限 {max_images}，仅处理前 {max_images} 张"
+                "[图片处理] 单条消息包含 %d 张图片，超过上限 %d，仅处理前 %d 张",
+                len(image_components),
+                max_images,
+                max_images,
             )
             image_components = image_components[:max_images]
 
@@ -283,23 +241,11 @@ class ImageHandler:
 
     @staticmethod
     def _format_special_component(component: BaseMessageComponent) -> str:
-        """
-        格式化特殊消息组件为文本表示
-
-        Args:
-            component: 消息组件
-
-        Returns:
-            格式化后的文本，如果不是特殊组件返回空字符串
-        """
         if isinstance(component, Face):
             return f"[表情:{component.id}]"
-        elif isinstance(component, At):
+        if isinstance(component, At):
             return f"[At:{component.qq}]"
-        elif isinstance(component, AtAll):
-            return "[At:all]"
-        elif isinstance(component, Reply):
-            # 格式化引用消息，保留引用内容让AI理解上下文
+        if isinstance(component, Reply):
             try:
                 message_content = getattr(component, "message_str", None) or getattr(
                     component, "message", None
@@ -313,77 +259,220 @@ class ImageHandler:
                 if message_content:
                     if sender_nickname and sender_id:
                         return f"[引用 {sender_nickname}(ID:{sender_id}): {message_content}]"
-                    elif sender_id:
+                    if sender_id:
                         return f"[引用 用户(ID:{sender_id}): {message_content}]"
-                    elif sender_nickname:
+                    if sender_nickname:
                         return f"[引用 {sender_nickname}: {message_content}]"
-                    else:
-                        return f"[引用消息: {message_content}]"
+                    return f"[引用消息: {message_content}]"
                 return "[引用消息]"
             except Exception:
                 return "[引用消息]"
-        else:
-            return ""
+        return ""
 
     @staticmethod
     def _extract_text_only(message_chain: List[BaseMessageComponent]) -> str:
-        """
-        从消息链提取纯文字，过滤图片
-
-        Args:
-            message_chain: 消息链
-
-        Returns:
-            纯文字内容
-        """
         text_parts = []
-
         for component in message_chain:
             if isinstance(component, Plain):
-                text_parts.append(ImageHandler._coerce_plain_text(component.text))
+                text_parts.append(component.text)
             elif isinstance(component, Image):
-                # 跳过图片
                 continue
             else:
-                # 其他类型的组件,尝试转为文本表示
                 formatted = ImageHandler._format_special_component(component)
                 if formatted:
                     text_parts.append(formatted)
-
-        result = "".join(text_parts).strip()
-        if not result:
-            logger.warning(
-                f"[图片处理] _extract_text_only 提取到空文本！text_parts={text_parts[:5]}"
-            )
-        return result
+        return "".join(text_parts).strip()
 
     @staticmethod
     async def _extract_image_urls(image_components: List[Image]) -> List[str]:
-        """
-        从图片组件列表中提取图片URL
-
-        Args:
-            image_components: 图片组件列表
-
-        Returns:
-            图片URL列表（可能包含本地路径或base64等格式）
-        """
         image_urls = []
         for idx, img_component in enumerate(image_components):
             try:
-                # 尝试获取图片路径或URL
                 image_path = await img_component.convert_to_file_path()
                 if image_path:
                     image_urls.append(image_path)
-                    if DEBUG_MODE:
-                        logger.info(f"提取到图片 {idx}: {image_path}")
                 else:
-                    logger.warning(f"无法提取图片 {idx} 的路径")
-            except Exception as e:
-                logger.error(f"提取图片 {idx} 的URL时发生错误: {e}")
+                    logger.warning("无法提取图片 %d 的路径", idx)
+            except Exception as exc:
+                logger.error("提取图片 %d 路径失败: %s", idx, exc)
+        return image_urls
+
+    @staticmethod
+    def _event_chat_key(event: AstrMessageEvent) -> str:
+        try:
+            platform_id = str(event.get_platform_id() or event.get_platform_name() or "")
+        except Exception:
+            platform_id = ""
+        try:
+            chat_id = (
+                event.get_group_id()
+                if not event.is_private_chat()
+                else event.get_sender_id()
+            )
+        except Exception:
+            chat_id = ""
+        return f"{platform_id}:{chat_id or 'unknown'}"
+
+    @staticmethod
+    def _event_sender_id(event: AstrMessageEvent) -> str:
+        try:
+            return str(event.get_sender_id() or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _evaluate_spam_gate(
+        image_spam_gate: Optional[ImageSpamGate],
+        *,
+        chat_key: str,
+        sender_id: str,
+        image_count: int,
+        batch_factor: float,
+        burst_factor: float,
+        quoted: bool,
+    ) -> ImageSpamDecision | None:
+        if not image_spam_gate:
+            return None
+        try:
+            return image_spam_gate.evaluate(
+                chat_key=chat_key,
+                sender_id=sender_id,
+                image_count=image_count,
+                batch_factor=batch_factor,
+                burst_factor=burst_factor,
+                quoted=quoted,
+            )
+        except Exception as exc:
+            logger.warning("[GCP图片刷图门] evaluate failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _build_structured_system_prompt(system_prompt: str = "") -> str:
+        return _build_structured_system_prompt_impl(system_prompt)
+
+    @staticmethod
+    def _build_structured_prompt(prompt: str, context_hint: str = "") -> str:
+        return _build_structured_prompt_impl(prompt, context_hint)
+
+    @staticmethod
+    def _compact_context_text(text: str, max_chars: int = 300) -> str:
+        return _compact_context_text_impl(text, max_chars)
+
+    @staticmethod
+    def _build_image_context_hint(
+        message_chain: List[BaseMessageComponent],
+        image_index: int,
+        image_count: int,
+        burst_factor: float = 1.0,
+    ) -> str:
+        return _build_image_context_hint_impl(
+            message_chain,
+            image_index,
+            image_count,
+            burst_factor,
+        )
+
+    @staticmethod
+    def _parse_structured_image_response(raw_text: str) -> tuple[str, float, bool, str]:
+        raw = str(raw_text or "").strip()
+        if not raw:
+            return "", 0.0, False, "empty_response"
+
+        candidates = [raw]
+        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S)
+        if fence_match:
+            candidates.insert(0, fence_match.group(1))
+        object_match = re.search(r"\{.*\}", raw, re.S)
+        if object_match:
+            candidates.append(object_match.group(0))
+
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
                 continue
 
-        return image_urls
+            extra_keys = set(data.keys()) - {"description", "importance"}
+            if extra_keys:
+                return "", 0.0, False, "unexpected_fields"
+
+            description = str(data.get("description") or "").strip()
+            if not description:
+                return "", 0.0, False, "missing_description"
+
+            try:
+                importance = float(data.get("importance"))
+            except Exception:
+                return description, 0.0, False, "invalid_importance"
+
+            if importance < 0.0 or importance > 1.0:
+                return (
+                    description,
+                    max(0.0, min(1.0, importance)),
+                    False,
+                    "importance_out_of_range",
+                )
+
+            return description, importance, True, ""
+
+        return "", 0.0, False, "json_parse_failed"
+
+    @staticmethod
+    def _placeholder_image_status(
+        idx: int,
+        image_ref: str,
+        status: str,
+        failure_reason: str,
+    ) -> dict:
+        return {
+            "index": idx,
+            "image_ref": image_ref or "",
+            "status": status,
+            "description": "",
+            "failure_reason": failure_reason,
+            "importance": 0.0,
+            "effective_importance": 0.0,
+            "keep": False,
+            "gate_reason": failure_reason,
+            "policy_version": POLICY_VERSION,
+        }
+
+    @staticmethod
+    async def _build_pending_image_statuses(
+        image_components: List[Image],
+        failure_reason: str,
+    ) -> list[dict]:
+        image_statuses: list[dict] = []
+        for idx, img_component in enumerate(image_components):
+            try:
+                image_ref = await img_component.convert_to_file_path()
+            except Exception:
+                image_ref = ""
+            image_statuses.append(
+                ImageHandler._placeholder_image_status(
+                    idx,
+                    image_ref,
+                    "pending_retry",
+                    failure_reason,
+                )
+            )
+        return image_statuses
+
+    @staticmethod
+    def _build_placeholder_message_text(message_chain: List[BaseMessageComponent]) -> str:
+        parts: list[str] = []
+        for component in message_chain:
+            if isinstance(component, Plain):
+                parts.append(component.text)
+            elif isinstance(component, Image):
+                parts.append("[图片]")
+            else:
+                formatted = ImageHandler._format_special_component(component)
+                if formatted:
+                    parts.append(formatted)
+        return "".join(parts).strip()
 
     @staticmethod
     async def _convert_images_to_text(
@@ -394,134 +483,267 @@ class ImageHandler:
         image_components: List[Image],
         timeout: int = 60,
         image_description_cache: Optional[ImageDescriptionCache] = None,
-        session_id: str = "",
-    ) -> Optional[str]:
-        """
-        将图片转换为文字描述
-
-        Args:
-            message_chain: 消息链
-            context: Context对象
-            provider_id: AI提供商ID
-            prompt: 转换提示词
-            image_components: 图片组件列表
-            timeout: 超时时间（秒）
-            image_description_cache: 图片描述缓存实例（可选）
-
-        Returns:
-            转换后的文本，失败返回None
-        """
+        image_importance_policy: Optional[ImageImportancePolicy] = None,
+        chat_key: str = "",
+        sender_id: str = "",
+        image_spam_gate: Optional[ImageSpamGate] = None,
+        image_to_text_system_prompt: str = "",
+    ) -> Tuple[Optional[str], List[dict]]:
         try:
-            # 获取指定的提供商
             provider = context.get_provider_by_id(provider_id)
             if not provider:
-                logger.error(f"无法找到提供商: {provider_id}")
-                return None
+                logger.error("无法找到提供商 %s", provider_id)
+                return None, [
+                    ImageHandler._placeholder_image_status(
+                        idx, "", "pending_retry", f"provider_not_found:{provider_id}"
+                    )
+                    for idx, _ in enumerate(image_components)
+                ]
 
-            # 建立message_chain中Image组件位置到image_components索引的映射
-            # 这样可以避免使用id()，更稳定可靠
-            image_chain_to_idx = {}
+            image_chain_to_idx: dict[int, int] = {}
             img_count = 0
             for chain_idx, component in enumerate(message_chain):
                 if isinstance(component, Image):
                     image_chain_to_idx[chain_idx] = img_count
                     img_count += 1
 
-            # 对每张图片进行转文字
-            image_descriptions = {}
+            burst_factor = 1.0
+            if image_importance_policy:
+                burst_factor = image_importance_policy.register_image_batch(
+                    chat_key=chat_key,
+                    image_count=len(image_components),
+                    timestamp=time.time(),
+                )
+            batch_factor = (
+                image_importance_policy.batch_factor(len(image_components))
+                if image_importance_policy
+                else 1.0
+            )
+            spam_decision = ImageHandler._evaluate_spam_gate(
+                image_spam_gate,
+                chat_key=chat_key,
+                sender_id=sender_id,
+                image_count=len(image_components),
+                batch_factor=batch_factor,
+                burst_factor=burst_factor,
+                quoted=any(isinstance(component, Reply) for component in message_chain),
+            )
+
+            image_descriptions: dict[int, str] = {}
+            image_statuses: list[dict] = []
+            structured_system_prompt = ImageHandler._build_structured_system_prompt(
+                image_to_text_system_prompt
+            )
+
+            if spam_decision and spam_decision.skip:
+                placeholder_text = ImageHandler._build_placeholder_message_text(
+                    message_chain
+                )
+                for idx, img_component in enumerate(image_components):
+                    try:
+                        image_path = await img_component.convert_to_file_path()
+                    except Exception:
+                        image_path = ""
+                    image_statuses.append(
+                        {
+                            "index": idx,
+                            "image_ref": image_path or "",
+                            "status": "skipped_spam_batch",
+                            "description": "",
+                            "failure_reason": spam_decision.reason,
+                            "importance": 0.0,
+                            "effective_importance": 0.0,
+                            "time_factor": 1.0,
+                            "burst_factor": burst_factor,
+                            "batch_factor": batch_factor,
+                            "threshold": 0.0,
+                            "keep": False,
+                            "gate_reason": spam_decision.reason,
+                            "policy_version": "image_spam_gate_v1",
+                        }
+                    )
+                return placeholder_text, image_statuses
+
             for idx, img_component in enumerate(image_components):
+                image_path = ""
                 try:
-                    # 获取图片URL或路径
                     image_path = await img_component.convert_to_file_path()
                     if not image_path:
-                        logger.warning(f"无法获取图片 {idx} 的路径")
+                        image_statuses.append(
+                            ImageHandler._placeholder_image_status(
+                                idx, "", "pending_retry", "empty_image_path"
+                            )
+                        )
                         continue
 
                     if DEBUG_MODE:
-                        logger.info(f"正在转换图片 {idx}: {image_path}")
+                        logger.info("正在转换图片 %d: %s", idx, image_path)
 
-                    # 🆕 v1.2.0: 先检查本地缓存，命中则跳过AI调用
                     if image_description_cache and image_description_cache.enabled:
                         cached_desc = image_description_cache.lookup(image_path)
                         if cached_desc:
-                            image_descriptions[idx] = cached_desc
-                            logger.info(
-                                f"[图片缓存] 图片 {idx} 命中缓存，跳过AI调用 (省钱!)"
+                            gate = (
+                                image_importance_policy.evaluate(
+                                    model_importance=0.5,
+                                    burst_factor=burst_factor,
+                                    batch_factor=batch_factor,
+                                ).to_dict()
+                                if image_importance_policy
+                                else {
+                                    "keep": True,
+                                    "importance": 0.5,
+                                    "effective_importance": 0.5,
+                                    "time_factor": 1.0,
+                                    "burst_factor": burst_factor,
+                                    "batch_factor": batch_factor,
+                                    "threshold": 0.0,
+                                    "gate_reason": "gate_disabled",
+                                    "policy_version": POLICY_VERSION,
+                                }
+                            )
+                            if gate.get("keep"):
+                                image_descriptions[idx] = cached_desc
+                            image_statuses.append(
+                                {
+                                    "index": idx,
+                                    "image_ref": image_path,
+                                    "status": "success",
+                                    "description": cached_desc,
+                                    "failure_reason": "",
+                                    "cache_hit": True,
+                                    **gate,
+                                }
                             )
                             continue
 
-                    # 调用AI进行图片转文字,添加超时控制
                     async def call_vision_ai():
+                        context_hint = ImageHandler._build_image_context_hint(
+                            message_chain,
+                            idx,
+                            len(image_components),
+                            burst_factor,
+                        )
                         response = await provider.text_chat(
-                            prompt=prompt,
+                            prompt=ImageHandler._build_structured_prompt(
+                                prompt, context_hint
+                            ),
                             contexts=[],
                             image_urls=[image_path],
                             func_tool=None,
-                            system_prompt="",
-                            session_id=session_id,
+                            system_prompt=structured_system_prompt,
                         )
                         return response.completion_text
 
-                    # 使用用户配置的超时时间
-                    description = await asyncio.wait_for(
+                    raw_description = await asyncio.wait_for(
                         call_vision_ai(), timeout=timeout
                     )
+                    description, importance, parse_ok, parse_reason = (
+                        ImageHandler._parse_structured_image_response(raw_description)
+                    )
+                    gate = (
+                        image_importance_policy.evaluate(
+                            model_importance=importance,
+                            burst_factor=burst_factor,
+                            batch_factor=batch_factor,
+                        ).to_dict()
+                        if image_importance_policy
+                        else {
+                            "keep": True,
+                            "importance": importance,
+                            "effective_importance": importance,
+                            "time_factor": 1.0,
+                            "burst_factor": burst_factor,
+                            "batch_factor": batch_factor,
+                            "threshold": 0.0,
+                            "gate_reason": "gate_disabled",
+                            "policy_version": POLICY_VERSION,
+                        }
+                    )
+                    if not parse_ok:
+                        gate = {
+                            **gate,
+                            "keep": False,
+                            "gate_reason": parse_reason,
+                        }
 
-                    if description:
+                    if gate.get("keep") and description:
                         image_descriptions[idx] = description
-                        if DEBUG_MODE:
-                            logger.info(f"图片 {idx} 转换成功: {description[:50]}...")
 
-                        # 🆕 v1.2.0: AI转换成功后，保存到本地缓存
-                        # 🔧 防御性编程：保存前再次检查缓存中是否已存在
-                        # 场景：并发处理两条含相同图片的消息，或平台描述已提前写入缓存
-                        if image_description_cache and image_description_cache.enabled:
-                            if not image_description_cache.lookup(image_path):
-                                image_description_cache.save(image_path, description)
+                    status = "success" if parse_ok else "failed_final"
+                    image_statuses.append(
+                        {
+                            "index": idx,
+                            "image_ref": image_path,
+                            "status": status,
+                            "description": description if parse_ok else "",
+                            "failure_reason": "" if parse_ok else parse_reason,
+                            "importance": importance,
+                            "effective_importance": gate.get("effective_importance", 0.0),
+                            "time_factor": gate.get("time_factor", 1.0),
+                            "burst_factor": gate.get("burst_factor", 1.0),
+                            "batch_factor": gate.get("batch_factor", 1.0),
+                            "threshold": gate.get("threshold", 0.0),
+                            "keep": bool(gate.get("keep")),
+                            "gate_reason": str(gate.get("gate_reason") or ""),
+                            "policy_version": gate.get("policy_version")
+                            or POLICY_VERSION,
+                        }
+                    )
+
+                    if (
+                        parse_ok
+                        and description
+                        and image_description_cache
+                        and image_description_cache.enabled
+                    ):
+                        if not image_description_cache.lookup(image_path):
+                            image_description_cache.save(image_path, description)
 
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        f"图片 {idx} 转文字超时（超过 {timeout} 秒），可在配置中调整 image_to_text_timeout 参数"
+                    image_statuses.append(
+                        ImageHandler._placeholder_image_status(
+                            idx,
+                            image_path,
+                            "pending_retry",
+                            f"timeout:{timeout}s",
+                        )
                     )
                     continue
-                except Exception as e:
-                    logger.error(f"{format_ai_error(e, f'图片转文字-{idx}')}")
+                except Exception as exc:
+                    logger.error("转换图片 %d 失败: %s", idx, exc)
+                    image_statuses.append(
+                        ImageHandler._placeholder_image_status(
+                            idx,
+                            image_path,
+                            "pending_retry",
+                            str(exc),
+                        )
+                    )
                     continue
 
-            # 如果没有成功转换任何图片,返回None
-            if not image_descriptions:
-                logger.warning("没有成功转换任何图片")
-                return None
+            if not any(item.get("status") in {"success", "failed_final"} for item in image_statuses):
+                return None, image_statuses
 
-            # 构建新的消息文本,将图片替换为描述
             result_parts = []
             for chain_idx, component in enumerate(message_chain):
                 if isinstance(component, Plain):
-                    result_parts.append(ImageHandler._coerce_plain_text(component.text))
+                    result_parts.append(component.text)
                 elif isinstance(component, Image):
-                    # 如果这张图片有描述,使用描述替换
-                    # 通过chain_idx找到对应的image_components索引
                     if chain_idx in image_chain_to_idx:
                         img_idx = image_chain_to_idx[chain_idx]
                         if img_idx in image_descriptions:
-                            result_parts.append(
-                                f"[图片内容: {image_descriptions[img_idx]}]"
-                            )
+                            result_parts.append(f"[图片内容: {image_descriptions[img_idx]}]")
                         else:
                             result_parts.append("[图片]")
                     else:
                         result_parts.append("[图片]")
                 else:
-                    # 其他组件使用统一的格式化方法
                     formatted = ImageHandler._format_special_component(component)
                     if formatted:
                         result_parts.append(formatted)
 
-            result_text = "".join(result_parts)
-            if DEBUG_MODE:
-                logger.info(f"图片转文字完成,处理后的消息: {result_text[:100]}...")
-            return result_text
+            return "".join(result_parts), image_statuses
 
-        except Exception as e:
-            logger.error(f"图片转文字过程发生错误: {e}")
-            return None
+        except Exception as exc:
+            logger.error("图片转文本过程发生错误: %s", exc)
+            return None, []

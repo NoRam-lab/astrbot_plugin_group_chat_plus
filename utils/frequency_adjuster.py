@@ -8,7 +8,7 @@
 - 自动微调概率参数
 
 作者: Him666233
-版本: V1.2.3.hotfix.1
+版本: v1.2.1
 参考: MaiBot frequency_control.py (简化实现)
 
 v1.2.0 更新：
@@ -16,19 +16,19 @@ v1.2.0 更新：
 """
 
 import time
-from typing import TYPE_CHECKING, Dict, Optional
-
-from astrbot.api.all import Context, logger
-from astrbot.api.event import AstrMessageEvent
-
+from typing import Dict, Optional
+from astrbot.api.all import logger, Context
 from .ai_response_filter import AIResponseFilter
-from .decision_ai import DecisionAI
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
+from astrbot.api.event import AstrMessageEvent
+
+# 导入 DecisionAI（延迟导入以避免循环依赖）
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    pass
+    from .decision_ai import DecisionAI
 
 
 class FrequencyAdjuster:
@@ -62,24 +62,6 @@ class FrequencyAdjuster:
         self.adjust_factor_increase = self.config["frequency_increase_factor"]
         self.min_probability = self.config["frequency_min_probability"]
         self.max_probability = self.config["frequency_max_probability"]
-        self.frequency_ai_include_persona = self.config.get(
-            "frequency_ai_include_persona", True
-        )
-        self.frequency_ai_persona_name = self.config.get(
-            "frequency_ai_persona_name", ""
-        )
-        # 🆕 额外推理配置
-        self.enable_reasoning = self.config.get("enable_frequency_ai_reasoning", False)
-        self.reasoning_log_enabled = self.config.get(
-            "frequency_ai_reasoning_log", False
-        )
-        self.reasoning_log_mode = self.config.get(
-            "frequency_ai_reasoning_log_mode", "processed"
-        )
-        self.reasoning_start_marker = self.config.get(
-            "judgment_reasoning_start_marker", ""
-        )
-        self.reasoning_end_marker = self.config.get("judgment_reasoning_end_marker", "")
 
         # 存储每个会话的检查状态（使用完整的会话标识确保隔离）
         # 格式: {chat_key: {"last_check_time": 时间戳, "message_count": 消息数}}
@@ -178,162 +160,12 @@ class FrequencyAdjuster:
             "过于频繁" / "过少" / "正常" / None(分析失败)
         """
         try:
-            # time_context 用于承载”当前时间与活跃度提示”这一大段文本
-            # 当未启用动态时间段功能时保持为空字符串，不影响原有频率判断逻辑
-            time_context = ""
-
-            # 如果开启了动态时间段概率功能（与主插件配置保持一致），
-            # 则在频率分析时也让 AI 知道“现在是一天中的哪个时间段、活跃度系数是多少”。
-            # 注意：这里只是把时间信息写进提示词，不直接修改概率数值。
-            # 🔧 使用字典键访问替代 config.get()，避免 astrBot 平台多次读取配置的问题
-            if self.config["enable_dynamic_reply_probability"]:
-                try:
-                    from .time_period_manager import TimePeriodManager
-                    from datetime import datetime as dt
-
-                    # 读取时间段配置 JSON，完全复用 TimePeriodManager 的解析与校验逻辑
-                    # 🔧 使用字典键访问替代 config.get()
-                    periods_json = self.config["reply_time_periods"]
-                    # silent=True 避免频繁重复解析时在日志中刷屏
-                    periods = TimePeriodManager.parse_time_periods(
-                        periods_json, silent=True
-                    )
-
-                    if periods:
-                        # 使用与 ProbabilityManager / DecisionAI 一致的时间系数计算方法
-                        # current_factor 表示当前时间下推荐的“活跃度倍率”，例如：
-                        #  - 0.2 表示应该明显少说话
-                        #  - 1.0 表示正常
-                        #  - 1.5 表示可以更活跃
-                        # 🔧 使用字典键访问替代 config.get()
-                        current_factor = TimePeriodManager.calculate_time_factor(
-                            current_time=None,
-                            periods_config=periods,
-                            transition_minutes=self.config[
-                                "reply_time_transition_minutes"
-                            ],
-                            min_factor=self.config["reply_time_min_factor"],
-                            max_factor=self.config["reply_time_max_factor"],
-                            use_smooth_curve=self.config["reply_time_use_smooth_curve"],
-                        )
-
-                        now = dt.now()
-                        # 将当前时间转换为一天中的分钟数，用于匹配配置中的时间段名称
-                        current_minutes = now.hour * 60 + now.minute
-                        current_period_name = ""
-
-                        # 在已解析的时间段列表中，找到当前时间所属的时间段名称（支持跨天配置）
-                        for period in periods:
-                            try:
-                                start_parts = period["start"].split(":")
-                                end_parts = period["end"].split(":")
-                                start_minutes = int(start_parts[0]) * 60 + int(
-                                    start_parts[1] if len(start_parts) > 1 else 0
-                                )
-                                end_minutes = int(end_parts[0]) * 60 + int(
-                                    end_parts[1] if len(end_parts) > 1 else 0
-                                )
-
-                                # 时间段跨天（例如 23:00-07:00）时，判断逻辑为
-                                #   当前 >= start 或 当前 < end
-                                # 否则为普通区间判断 start <= 当前 < end
-                                if start_minutes > end_minutes:
-                                    in_period = (
-                                        current_minutes >= start_minutes
-                                        or current_minutes < end_minutes
-                                    )
-                                else:
-                                    in_period = (
-                                        start_minutes <= current_minutes < end_minutes
-                                    )
-
-                                if in_period:
-                                    current_period_name = period.get(
-                                        "name", f"{period['start']}-{period['end']}"
-                                    )
-                                    break
-                            except Exception:
-                                # 单个时间段解析失败不影响整体，直接跳过即可
-                                continue
-
-                        weekday_names = [
-                            "周一",
-                            "周二",
-                            "周三",
-                            "周四",
-                            "周五",
-                            "周六",
-                            "周日",
-                        ]
-                        current_weekday = weekday_names[now.weekday()]
-                        current_time_str = now.strftime(
-                            f"%Y-%m-%d {current_weekday} %H:%M:%S"
-                        )
-
-                        # 根据 current_factor 的数值区间，给出更直观的中文描述和建议文案，
-                        # 这些描述只影响 LLM 的理解，不会改变概率计算代码本身。
-                        if current_factor < 0.3:
-                            factor_desc = "非常低"
-                            activity_suggestion = "用户配置此时段应该很少回复。一般认为Bot应该尽量安静，只有在必要的情况下才发言。"
-                        elif current_factor < 0.5:
-                            factor_desc = "很低"
-                            activity_suggestion = "用户配置此时段应该较少回复。除非话题比较重要或直接与Bot相关，否则应该减少发言。"
-                        elif current_factor < 0.8:
-                            factor_desc = "偏低"
-                            activity_suggestion = "用户配置此时段应该适当减少回复。可以适度降低存在感，不要频繁插话。"
-                        elif current_factor <= 1.2:
-                            factor_desc = "正常"
-                            activity_suggestion = (
-                                "用户配置此时段活跃度正常。可以按正常频率参与对话。"
-                            )
-                        elif current_factor <= 1.5:
-                            factor_desc = "偏高"
-                            activity_suggestion = "用户配置此时段应该更活跃。可以适当多说一些，让气氛活跃一点。"
-                        else:
-                            factor_desc = "很高"
-                            activity_suggestion = "用户配置此时段应该非常活跃。Bot可以比较健谈，只要不打扰他人正常对话即可。"
-
-                        # time_context 最终是一整块可读性较强的文本，会被直接插入到下面构造的 prompt 中，
-                        # 用于告诉 LLM 当前所处时间段和推荐的活跃度。
-                        time_context = (
-                            f"\n\n[系统信息-时间与活跃度]\n"
-                            f"当前时间: {current_time_str} ({current_weekday})\n"
-                            f"用户配置的时间段: {current_period_name or '默认时段'}\n"
-                            f"活跃度系数: {current_factor:.2f} ({factor_desc})\n"
-                            f"建议: {activity_suggestion}\n"
-                        )
-                except Exception as e:
-                    # 时间段配置解析或计算失败时，不影响频率分析主流程，只在调试模式下输出日志
-                    if DEBUG_MODE:
-                        logger.info(f"[频率动态调整器] 获取时间段配置失败: {e}")
-
             # 🔧 v1.2.0: 缓存友好的提示词拼接顺序
             # 将静态指令（角色、格式说明、判断标准、输出要求）放在最前面，
             # 动态内容（时间段信息、聊天记录）放在最后面。
             # 这样AI服务商的前缀缓存（prefix caching）可以命中静态部分，降低调用成本。
-            _use_reasoning = self.enable_reasoning
-            _r_start = self.reasoning_start_marker if _use_reasoning else ""
-            _r_end = self.reasoning_end_marker if _use_reasoning else ""
-
-            # 根据是否启用额外推理选择不同的输出要求
-            if _use_reasoning and _r_start and _r_end:
-                output_requirement = DecisionAI._build_reasoning_protocol(
-                    _r_start,
-                    _r_end,
-                    allowed_answers=["正常", "过于频繁", "过少"],
-                )
-            else:
-                output_requirement = (
-                    "【输出要求】\n"
-                    "- 最终结论必须且只能是以下三个词之一：正常 / 过于频繁 / 过少\n"
-                    "- 最终结论必须独占最后一行，不要输出解释、前缀、后缀或标点\n"
-                    "- 不要输出任何其他文字\n"
-                )
-
             prompt = f"""你是一个群聊观察者。请根据下方提供的聊天记录，判断AI助手的发言频率是否合适。
 
-{DecisionAI.build_judgment_persona_notice("频率判断")}
-{DecisionAI.build_frequency_judgment_notice()}
 【当前人格与时间说明】
 - 你需要结合你当前的人格设定，判断在不同时间段下你应该多活跃或少活跃。
 - 如果下方提供了「当前时间与活跃度提示」，请参考用户配置的活跃度系数来判断现在说话是否合适。
@@ -355,16 +187,20 @@ class FrequencyAdjuster:
 - 如果AI（assistant）长时间不发言，即使有用户（user）提到相关话题也不回应 → 过少
 - 如果AI（assistant）的发言频率自然，既不抢话也不冷场 → 正常
 
-{output_requirement}
+**你只能输出以下三个词之一，不要输出任何其他文字、解释或标点：**
+- 正常
+- 过于频繁
+- 过少
 
 请根据下方信息进行判断：
-{time_context}
 最近的聊天记录：
 {recent_messages}"""
 
             # 复用 DecisionAI.call_decision_ai，而不是直接调用底层 provider：
             # 这样可以自动继承人格设定、上下文注入以及统一的思考链过滤逻辑，
             # 同时保持与主读空气逻辑一致的安全性和行为习惯。
+            from .decision_ai import DecisionAI
+
             response = await DecisionAI.call_decision_ai(
                 context=context,
                 event=event,
@@ -372,33 +208,15 @@ class FrequencyAdjuster:
                 provider_id=provider_id,
                 timeout=timeout,
                 prompt_mode="override",
-                include_persona=self.frequency_ai_include_persona,
-                configured_persona_name=self.frequency_ai_persona_name,
-                context_label="频率动态调整器",
             )
 
             if not response:
                 logger.warning("[频率动态调整器] AI返回为空")
                 return None
 
-            # 🆕 统一解析协议：先过滤模型原生思考链，再提取自定义推理块，最后归一化频率结论
-            parse_result = AIResponseFilter.parse_frequency_response(
-                response,
-                start_marker=_r_start,
-                end_marker=_r_end,
-            )
-
-            # 如果启用了额外推理且开启了日志，按配置输出推理信息
-            if _use_reasoning:
-                DecisionAI.log_reasoning_output(
-                    log_prefix="[频率动态调整器-额外推理]",
-                    raw_response=response,
-                    parse_result=parse_result,
-                    log_enabled=self.reasoning_log_enabled,
-                    log_mode=self.reasoning_log_mode,
-                )
-
-            decision = parse_result.get("normalized_answer")
+            # 使用专门的频率判断结果提取器，将 LLM 的自然语言输出归一化为
+            # "正常" / "过于频繁" / "过少" 三种枚举值，避免下游逻辑需要解析自由文本。
+            decision = AIResponseFilter.extract_frequency_decision(response)
 
             if decision:
                 logger.info(f"[频率动态调整器] AI判断结果: {decision}")
@@ -464,9 +282,6 @@ class FrequencyAdjuster:
         self.check_states[chat_key] = {
             "last_check_time": time.time(),
             "message_count": 0,
-            "adjusted_probability": self.check_states.get(chat_key, {}).get(
-                "adjusted_probability"
-            ),
         }
 
     def record_message(self, chat_key: str):

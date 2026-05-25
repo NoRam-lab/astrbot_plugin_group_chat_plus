@@ -3,7 +3,7 @@
 用于从平台的聊天记忆增强功能中提取图片描述信息
 
 作者: Him666233
-版本: V1.2.3.hotfix.1
+版本: v1.2.1
 """
 
 import re
@@ -934,8 +934,7 @@ class PlatformLTMHelper:
                 if isinstance(component, Image):
                     has_image = True
                 elif isinstance(component, Plain):
-                    text = component.text if isinstance(component.text, str) else ""
-                    if text.strip():
+                    if component.text and component.text.strip():
                         has_text = True
 
             return has_image and not has_text

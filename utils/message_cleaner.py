@@ -6,11 +6,6 @@ v1.0.4 更新：
 - 添加对发送者识别系统提示的清理规则
 - 在保存到官方历史时过滤掉系统提示
 
-v1.1.0 更新：
-- 🆕 增加主动对话提示词的特殊处理
-- 主动对话的系统提示词会保留到官方历史（让AI理解上下文）
-- 使用特殊标记 [PROACTIVE_CHAT] 标识主动对话消息
-
 v1.1.2 更新：
 - 🔧 增强清理规则，添加更多系统提示词的检测模式
 - 新增清理：情绪状态、背景信息、记忆列表、工具列表、对话对象提醒等
@@ -23,24 +18,21 @@ v1.2.0 更新：
 
 v1.2.1 更新：
 - 🆕 适配人格中立化改造的新格式 [系统信息-xxx] / [系统指令-xxx] / [系统提示-xxx] 标记
-- 新增清理：发送者识别、对话对象、疲劳收尾、元指令声明、时间活跃度、关键词触发、兴趣话题、对话疲劳、主动对话上下文、历史上下文识别等新格式标记
+- 新增清理：发送者识别、对话对象、疲劳收尾、元指令声明、时间活跃度、关键词触发、兴趣话题、对话疲劳、历史上下文识别等新格式标记
 - 🆕 适配新版历史标记格式：【禁止重复-你的历史回复】前缀、历史分隔线、追加消息身份提醒
 - 新增清理：新版当前消息分隔线（含"以上全部是历史消息"提示）、回复密度提示
 
 
 作者: Him666233
-版本: V1.2.3.hotfix.1
+版本: v1.2.1
 """
 
-import logging
 import re
-from typing import Any
 from astrbot.api.all import *
-from astrbot.api.message_components import Plain, At, AtAll, Image, Reply
-from astrbot.core.message.components import Forward
+from astrbot.api.message_components import Plain, At, Image, Reply
+from astrbot.core.message.components import Forward, File, Video, Json
 
-logger = logging.getLogger(__name__)
-AstrMessageEvent = Any
+from .json_card_formatter import format_json_card_message
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
@@ -54,42 +46,7 @@ class MessageCleaner:
     1. 移除系统自动添加的@消息提示词
     2. 移除决策AI相关的提示词
     3. 只保留原始用户消息内容
-    4. 🆕 v1.1.0: 特殊处理主动对话提示词（保留到历史）
     """
-
-    # 🆕 v1.1.0: 主动对话标记
-    # 用于标识AI主动发起的对话，这个标记和相关提示词会保留到官方历史
-    PROACTIVE_CHAT_MARKER = "[PROACTIVE_CHAT]"
-
-    # 🆕 窗口追加消息上下文标记
-    # 用于标识AI回复时已参考了窗口缓冲的追加消息（Phase-2保存在回复之后）
-    # ⚠️ 受保护标记：clean_message() 不应移除此标记，它需要保留在历史中帮助AI理解时序
-    WINDOW_CONTEXT_MARKER = "[追加消息上下文]"
-
-    # 🆕 v1.1.0: 主动对话系统提示词的特征模式
-    # 这些提示词会被保留到官方历史，让AI理解自己是主动发起的
-    PROACTIVE_CHAT_PROMPT_PATTERNS = [
-        r"\[🎯主动发起新话题\]",  # 🆕 v1.1.2: 首次主动对话标记
-        r"\[🔄再次尝试对话\]",  # 🆕 v1.1.2: 重试场景标记
-        r"\[系统提示 - 主动发起新话题场景\]",
-        r"你刚刚主动发起了一个新话题",
-        r"这是你主动发起的对话",
-    ]
-
-    # 🆕 v1.2.x: 主动对话提示词保存时需移除的指令性段落
-    # 主动对话提示词前半部分（开场白、上下文说明、核心要求1-5）对后续AI理解
-    # "我刚主动发了条消息"有帮助，应保留。但从"关于背景信息和记忆"开始的
-    # 后半部分纯粹是生成阶段的指令约束，保存到历史只会污染上下文，应移除。
-    # 每个模式匹配从该标题到字符串末尾（[\s\S]*$），命中第一个后后续不再生效。
-    PROACTIVE_PROMPT_CLEANUP_PATTERNS = [
-        # 主入口：背景信息和记忆说明 → 从此处到末尾全部是生成指令
-        r"⚠️ \*\*【关于背景信息和记忆】重要说明\*\* ⚠️：[\s\S]*$",
-        # 兜底：如果用户自定义提示词去掉了背景信息段，则匹配后续标题
-        r"\n⛔ \*\*【严禁元叙述】特别重要！\*\* ⛔：[\s\S]*$",
-        r"\n话题建议：[\s\S]*$",
-        r"\n特殊标记说明：[\s\S]*$",
-        r"\n记住：就像是你自己突然想到了什么，很自然地说出来[\s\S]*$",
-    ]
 
     # @消息提示词的特征模式（用于识别和移除）
     AT_MESSAGE_PROMPT_PATTERNS = [
@@ -102,7 +59,7 @@ class MessageCleaner:
         r"\[User ID:.*?Nickname:.*?\]",
         r"\[当前情绪状态:.*?\]",  # 🆕 情绪状态提示（旧格式）
         r"\[系统信息-情绪参考:.*?\]",  # 🆕 情绪状态提示（新格式）
-        # 🆕 v1.2.2-hotfix.1: 人格中立化改造 - 新格式 [系统信息-xxx] 标记
+        # 🆕 v1.3.0: 人格中立化改造 - 新格式 [系统信息-xxx] 标记
         r"\[系统信息-当前发送者\][^\n]*\n注意：[^\n]*\n",  # 发送者识别（决策AI），含两行注意
         r"\[系统信息-当前对话对象\][^\n]*\n注意：[^\n]*\n",  # 对话对象识别（回复AI），含两行注意
         r"\[系统提示-对话收尾\][\s\S]*?(?=\n\n|$)",  # 疲劳收尾提示
@@ -122,7 +79,7 @@ class MessageCleaner:
         r"\s*\[戳一戳提示\]这是一个戳一戳消息，但不是戳你的，是.*在戳.*",
         # 🆕 v1.1.1: 戳过对方提示（AI刚刚主动戳过对方，供AI参考，不应保存）
         r"\s*\[戳过对方提示\]你刚刚戳过这条消息的发送者.*",
-        # 🆕 单独无信息@消息时嵌入的多行提示词（有缓存摘要版和无缓存版）
+        # 🆕 空@时嵌入的多行提示词（有缓存摘要版和无缓存版）
         # 注意：必须在通用单行[系统提示]规则之前，否则头部被先删掉导致多行规则失效
         r"\[系统提示\][^\n]+单独@了你，没有附带任何文字内容。\n以下是@你之前[\s\S]*?用你自己的方式回应就好。",
         r"\[系统提示\][^\n]+单独@了你，没有附带任何消息内容，也没有特别需要接上的近期上下文，自然回应就好。",
@@ -185,45 +142,28 @@ class MessageCleaner:
         r"\n*=+\n*🔄 【对话收尾提示】[\s\S]*?=+\n*",  # 回复AI的收尾提示
         r"与当前用户的连续对话轮次:[\s\S]*?(?=\n\n|$)",  # 疲劳轮次信息
         r"你已经与这个用户连续对话了 \d+ 轮[\s\S]*?(?=\n\n|$)",  # 收尾提示内容
-        # 🆕 v1.2.2-hotfix.1: 人格中立化改造 - 新格式 [系统信息-xxx] 标记
+        # 🆕 v1.3.0: 人格中立化改造 - 新格式 [系统信息-xxx] 标记
         r"\[系统信息-时间与活跃度\][\s\S]*?(?=\n\n|$)",
         r"\[系统信息-关键词触发\][\s\S]*?(?=\n\n|$)",
         r"\[系统信息-兴趣话题\][\s\S]*?(?=\n\n|$)",
         r"\[系统信息-对话疲劳\][\s\S]*?(?=\n\n|$)",
-        r"\[系统信息-主动对话上下文\][\s\S]*?(?=\n\n|$)",
         r"\[系统指令-历史上下文识别\][\s\S]*?(?=请开始|$)",
         r"你是一个群聊参与者，请严格按照你的人格设定[\s\S]*?请开始判断",  # 新版决策AI开头
         # 🆕 窗口缓冲消息区域（追加消息提示词，保存时需过滤）
         r"--- 以下是你收到这条消息后，同一用户或其他用户紧接着又发的消息 ---[\s\S]*?--- 以上为紧接着的追加消息 ---",
-        r"这些追加消息帮助你理解完整对话背景。追加消息的发送者可能与当前对话对象不同，注意根据名字和ID区分。",
-        r"\[系统信息-Smart并发追加消息\][\s\S]*?(?=\n\n|$)",
-        r"\[系统提示-Smart并发\][\s\S]*?(?=\n\n|$)",  # Smart批次回复提示增强
-        r"\[第三方插件补充信息\][\s\S]*?\[第三方插件补充信息结束\]",  # 第三方插件补充信息整块
-        r"\[第三方插件片段 \d+\][\s\S]*?\[第三方插件片段 \d+ 结束\]",  # 第三方插件片段兜底
-        r"\[第三方插件注入上下文\]",  # 第三方插件上下文分隔消息
+        r"这些消息不一定是对你说的，请自行参考判断是否需要在回复中一并考虑。",
+        r"重要：这些追加消息的发送者可能与当前对话对象不同，请根据每条消息的发送者名字和ID仔细区分。",
         # 🆕 v1.2.1: 新版历史标记和分隔线
         r"【禁止重复-你的历史回复】",  # 新版 bot 历史回复前缀标记
         r"=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===",  # 新版历史分隔提示
         r"=== 【重要】以下是当前新消息（请优先关注这条消息的核心内容）===",  # 新版当前消息分隔线
         r"\[系统信息-回复密度\][\s\S]*?(?=\n\n|$)",  # 回复密度提示
-        r"\[Smart合并\][^\n]*",  # 🆕 v1.2.2-hotfix.1: Smart并发合并虚拟AI回复标记
-        r"\[系统信息-最近未接上对话\][\s\S]*?(?=\n\n|$)",  # 最近未接上对话（决策AI）
-        r"\[系统提示-单独无信息@消息上下文提醒\][\s\S]*?(?=\n\n|$)",  # 单独无信息@消息提醒
-        r"\[空@补充提示\][\s\S]*?(?=\n\n|$)",  # 兼容旧版空@中性强化提示
-        r"如果最近未接上的人不是当前发送者本人，不要强行续接别人的话题。",  # 最近未接上补充尾句
-        r"当前这个单独@你的人，和你最近一次明确回复的对象是同一个人，[\s\S]*?不要强行续话。",  # 兼容旧版空@同人强化
-        r"当前这个人单独@了你，但没有附带其他内容。[\s\S]*?不要死盯上一段对话。",  # 兼容旧版空@异人/中性强化
-        r"空@AI强化始终默认生效，不提供单独配置项",  # 兼容旧版展示文案兜底
-        r"\[系统提示-工具提醒开始\][\s\S]*?\[系统提示-工具提醒结束\]",  # 工具提醒整块
     ]
 
     @staticmethod
     def clean_message(message_text: str) -> str:
         """
         清理消息，移除系统添加的提示词
-
-        ⚠️ 注意：此方法会移除所有系统提示词，包括主动对话的提示词
-        如果需要保留主动对话提示词，请使用 clean_message_preserve_proactive
 
         Args:
             message_text: 原始消息（可能包含提示词）
@@ -254,104 +194,6 @@ class MessageCleaner:
         cleaned = cleaned.strip()
 
         return cleaned
-
-    @staticmethod
-    def is_proactive_chat_message(message_text: str) -> bool:
-        """
-        🆕 v1.1.0: 检测消息是否为主动对话消息
-
-        Args:
-            message_text: 消息文本
-
-        Returns:
-            True=主动对话消息, False=普通消息
-        """
-        if not message_text:
-            return False
-
-        # 检查是否包含主动对话标记
-        if MessageCleaner.PROACTIVE_CHAT_MARKER in message_text:
-            return True
-
-        # 检查是否包含主动对话提示词特征
-        for pattern in MessageCleaner.PROACTIVE_CHAT_PROMPT_PATTERNS:
-            if re.search(pattern, message_text):
-                return True
-
-        return False
-
-    @staticmethod
-    def clean_message_preserve_proactive(message_text: str) -> str:
-        """
-        🆕 v1.1.0: 清理消息，但保留主动对话的系统提示词
-
-        用于保存到官方历史时的清理，让AI能理解自己之前主动发起的对话
-
-        Args:
-            message_text: 原始消息（可能包含提示词）
-
-        Returns:
-            清理后的消息（保留主动对话提示词，移除其他系统提示词）
-        """
-        if not message_text:
-            return message_text
-
-        # 如果不是主动对话消息，使用普通清理
-        if not MessageCleaner.is_proactive_chat_message(message_text):
-            return MessageCleaner.clean_message(message_text)
-
-        # 是主动对话消息，需要保留主动对话提示词
-        cleaned = message_text
-
-        # 移除@消息提示词（这些不会与主动对话提示词冲突）
-        for pattern in MessageCleaner.AT_MESSAGE_PROMPT_PATTERNS:
-            cleaned = re.sub(pattern, "", cleaned, flags=re.DOTALL)
-
-        # ⚠️ 不应用 DECISION_AI_PROMPT_PATTERNS！
-        # 这些模式使用 [\s\S]*?(?=请开始回复|$) 收尾，主动对话提示词中
-        # 没有"请开始回复"，会导致 $ 匹配到字符串末尾造成错误截断。
-        # 下方用 PROACTIVE_PROMPT_CLEANUP_PATTERNS 替代，精确裁剪
-        # 主动对话提示词内部不应保存到历史的指令性段落。
-
-        # ⚠️ 不移除主动对话提示词标记 - 这是关键区别！
-
-        # 移除主动对话提示词中不应保存的指令性段落
-        # （⚠️关于背景信息和记忆 → ⛔严禁元叙述 → 话题建议 → 特殊标记说明 → 记住：...）
-        for pattern in MessageCleaner.PROACTIVE_PROMPT_CLEANUP_PATTERNS:
-            cleaned = re.sub(pattern, "", cleaned, flags=re.DOTALL)
-
-        # 清理多余的分隔符（=====）
-        cleaned = re.sub(r"\n*=+\n*", "\n", cleaned)
-
-        # 清理多余的空白行
-        cleaned = re.sub(r"\n\s*\n\s*\n", "\n\n", cleaned)
-
-        # 去除首尾空白
-        cleaned = cleaned.strip()
-
-        return cleaned
-
-    @staticmethod
-    def mark_proactive_chat_message(message_text: str) -> str:
-        """
-        🆕 v1.1.0: 标记消息为主动对话消息
-
-        在消息开头添加主动对话标记
-
-        Args:
-            message_text: 原始消息
-
-        Returns:
-            带标记的消息
-        """
-        if not message_text:
-            return message_text
-
-        # 如果已经有标记，不重复添加
-        if MessageCleaner.PROACTIVE_CHAT_MARKER in message_text:
-            return message_text
-
-        return f"{MessageCleaner.PROACTIVE_CHAT_MARKER}\n{message_text}"
 
     @staticmethod
     def filter_poke_text_marker(text: str) -> str:
@@ -419,13 +261,11 @@ class MessageCleaner:
                         # 纯文本组件
                         # 🔧 修复：防御性检查text是否为None，避免某些平台/情况下text为None导致消息丢失
                         if component.text is not None:
-                            raw_parts.append(str(component.text))
+                            raw_parts.append(component.text)
                     elif isinstance(component, At):
                         # @组件，保留@标记
                         if hasattr(component, "qq"):
                             raw_parts.append(f"[At:{component.qq}]")
-                    elif isinstance(component, AtAll):
-                        raw_parts.append("[At:all]")
                     elif isinstance(component, Image):
                         # 图片组件，保留图片标记
                         raw_parts.append("[图片]")
@@ -434,6 +274,30 @@ class MessageCleaner:
                         reply_text = MessageCleaner._format_reply_component(component)
                         if reply_text:
                             raw_parts.append(reply_text)
+                    elif isinstance(component, Video):
+                        # 🆕 视频组件：提取URL，便于 videosummary 等插件从上下文中识别视频链接
+                        video_url = getattr(component, "file", "") or ""
+                        if video_url:
+                            raw_parts.append(f"[视频](原始消息：{video_url})")
+                        else:
+                            raw_parts.append("[视频]")
+                    elif isinstance(component, File):
+                        # 🆕 文件组件：提取文件名和URL，便于下游插件识别文件来源
+                        file_name = getattr(component, "name", "") or ""
+                        file_url = getattr(component, "url", "") or ""
+                        if file_url and file_name:
+                            raw_parts.append(f"[文件:{file_name}](原始消息：{file_url})")
+                        elif file_url:
+                            raw_parts.append(f"[文件](原始消息：{file_url})")
+                        elif file_name:
+                            raw_parts.append(f"[文件:{file_name}]")
+                        else:
+                            raw_parts.append("[文件]")
+                    elif isinstance(component, Json):
+                        # 🆕 JSON卡片组件：提取小程序/分享卡片中的原始链接（如 qqdocurl）
+                        json_text = MessageCleaner._format_json_component(component)
+                        if json_text:
+                            raw_parts.append(json_text)
                     elif isinstance(component, Forward):
                         # 转发消息组件：如果未被提前解析（如转发解析功能关闭），使用占位标记
                         raw_parts.append("[转发消息]")
@@ -505,6 +369,24 @@ class MessageCleaner:
             return ""
 
     @staticmethod
+    def _format_json_component(json_component) -> str:
+        """
+        格式化 JSON 卡片组件为可落库文本。
+
+        典型场景：QQ 小程序/B站分享卡片中，真实外链位于
+        meta.detail_1.qqdocurl，需要保留到 group_chat_plus 自有上下文库，
+        便于 videosummary 等下游插件从历史上下文中识别链接。
+        """
+        try:
+            return format_json_card_message(
+                getattr(json_component, "data", None), fallback="[JSON消息]"
+            )
+        except Exception as e:
+            if DEBUG_MODE:
+                logger.info(f"[消息清理] 格式化JSON卡片失败: {e}")
+            return "[JSON消息]"
+
+    @staticmethod
     def _format_reply_component(reply_component) -> str:
         """
         格式化引用消息组件为文本表示
@@ -518,6 +400,7 @@ class MessageCleaner:
         try:
             # 尝试提取引用的消息内容
             # Reply组件包含：sender_id, sender_nickname, message_str等字段
+            parts = []
 
             # 🆕 获取发送者ID和昵称（根据AstrBot的Reply组件定义）
             sender_id = None
@@ -565,55 +448,31 @@ class MessageCleaner:
             return "[引用消息]"
 
     @staticmethod
-    def is_empty_at_message(
-        raw_message: str,
-        is_at_message: bool,
-        mention_info: dict | None = None,
-        mode: str = "only_ai",
-    ) -> bool:
+    def is_empty_at_message(raw_message: str, is_at_message: bool) -> bool:
         """
-        判断是否是空@消息。
+        判断是否是纯@消息（只有@没有其他内容）
 
         Args:
             raw_message: 原始消息
-            is_at_message: 是否是@AI消息
-            mention_info: 完整@解析结果（可选）
-            mode:
-                - contains_ai: 只要空消息里包含@AI就算
-                - only_ai: 空消息里只能包含@AI（可重复），不能包含他人/全体
+            is_at_message: 是否是@消息
 
         Returns:
-            True=满足指定模式的空@消息，False=不满足
+            True=纯@消息（只有@标记），False=有其他内容
         """
         if not is_at_message:
             return False
 
-        # 先判断是否为空消息：移除所有@标记（兼容裸At与已解析At）
-        without_at = re.sub(r"\[At:[^\]|]+(?:\|[^\]]*)?\]", "", raw_message or "")
+        # 移除所有@标记
+        without_at = re.sub(r"\[At:\d+\]", "", raw_message)
+        # 移除空白字符
         without_at = without_at.strip()
-        if without_at:
-            return False
 
-        mention_info = mention_info if isinstance(mention_info, dict) else {}
-        has_structured_mentions = bool(mention_info)
-        has_at_ai = bool(mention_info.get("has_at_ai", False))
-        has_at_others = bool(mention_info.get("has_at_others", False))
-        has_at_all = bool(mention_info.get("has_at_all", False))
+        # 如果移除@后为空，说明是纯@消息
+        is_empty = len(without_at) == 0
 
-        if mode == "contains_ai":
-            # 宽松模式：只要空消息里明确包含@AI就算；若解析结构缺失，则回退到 is_at_message
-            is_empty = has_at_ai or (is_at_message and not has_structured_mentions)
-        else:
-            # only_ai: 必须依赖结构化结果，且只能包含@AI（可重复），不能含他人/全体
-            is_empty = (
-                has_structured_mentions
-                and has_at_ai
-                and not has_at_others
-                and not has_at_all
-            )
-
-        if is_empty and DEBUG_MODE:
-            logger.info(f"[消息清理] 检测到空@消息（mode={mode}）")
+        if is_empty:
+            if DEBUG_MODE:
+                logger.info("[消息清理] 检测到纯@消息（无其他内容）")
 
         return is_empty
 

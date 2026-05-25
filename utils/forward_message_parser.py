@@ -24,7 +24,10 @@ from astrbot.api import logger
 from astrbot.core.message.components import Forward, Plain
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
+from .json_card_formatter import format_json_card_message
 
+
+# 硬上限常量
 FORWARD_NESTING_HARD_LIMIT = 10
 FORWARD_API_CALL_HARD_LIMIT = 30
 
@@ -40,7 +43,24 @@ class ForwardMessageParser:
         max_nesting_depth: int = 3,
         debug_mode: bool = False,
     ) -> bool:
+        """
+        尝试解析事件中的转发消息并替换消息链。
+        支持嵌套转发，递归深度受 max_nesting_depth 控制（硬上限10层）。
+
+        所有配置通过参数传入，不直接读取 config。
+
+        Args:
+            event: AstrBot 消息事件
+            include_sender_info: 是否包含发送者信息（名字+ID）
+            include_timestamp: 是否包含时间戳
+            max_nesting_depth: 嵌套转发最大解析深度（0=不解析嵌套，硬上限10）
+            debug_mode: 是否输出调试日志
+
+        Returns:
+            True 表示检测到并成功解析了转发消息，False 表示无转发或解析失败。
+        """
         try:
+            # 检查消息链是否存在
             if not hasattr(event, "message_obj") or not hasattr(
                 event.message_obj, "message"
             ):
@@ -49,6 +69,7 @@ class ForwardMessageParser:
             if not message_chain:
                 return False
 
+            # 查找 Forward 组件
             forward_indices = []
             for i, component in enumerate(message_chain):
                 if isinstance(component, Forward):
@@ -60,6 +81,7 @@ class ForwardMessageParser:
             if debug_mode:
                 logger.info(f"[转发消息] 检测到 {len(forward_indices)} 个转发消息组件")
 
+            # 检查平台支持：需要 bot 具有 call_action 方法（aiocqhttp 特有）
             call_action = _get_call_action(event)
             if call_action is None:
                 if debug_mode:
@@ -68,42 +90,43 @@ class ForwardMessageParser:
                     )
                 return False
 
+            # 限制嵌套深度在硬上限内
             effective_max_depth = min(
                 max(max_nesting_depth, 0), FORWARD_NESTING_HARD_LIMIT
             )
-            parse_context = _create_parse_context()
 
+            # API 调用计数器（跨所有递归共享）
+            api_call_counter = {"count": 0}
+
+            # 获取转发者信息（即触发此事件的发送者）
             forwarder_name = event.get_sender_name() or ""
             forwarder_id = event.get_sender_id() or ""
+
+            # 获取事件时间戳
             event_timestamp = getattr(event.message_obj, "timestamp", 0) or int(
                 time.time()
             )
 
             any_parsed = False
 
+            # 逆序遍历，这样替换不会影响前面的索引
             for idx in reversed(forward_indices):
                 forward_comp = message_chain[idx]
                 forward_id = getattr(forward_comp, "id", None)
                 if not forward_id:
                     if debug_mode:
-                        logger.info("[转发消息] Forward 组件无 id 字段，跳过")
+                        logger.info(f"[转发消息] Forward 组件无 id 字段，跳过")
                     continue
 
                 if debug_mode:
                     logger.info(f"[转发消息] 正在获取转发内容，ID: {forward_id}")
 
-                nodes = await _get_forward_nodes_by_id(
-                    call_action,
-                    str(forward_id),
-                    parse_context,
-                    debug_mode,
-                )
+                # 调用 API 获取转发消息内容
+                api_call_counter["count"] += 1
+                nodes = await _fetch_forward_nodes(call_action, forward_id, debug_mode)
 
                 if nodes is None:
-                    logger.warning(
-                        f"[转发消息] 获取转发内容失败，forward_id={forward_id}，"
-                        "已替换为占位标识"
-                    )
+                    # API 失败，使用占位文本
                     placeholder = _build_header(
                         "[转发消息]（内容获取失败）",
                         forwarder_name,
@@ -117,6 +140,7 @@ class ForwardMessageParser:
                     any_parsed = True
                     continue
 
+                # 解析节点内容为文本
                 formatted_text = await _format_forward_message(
                     nodes=nodes,
                     call_action=call_action,
@@ -126,27 +150,30 @@ class ForwardMessageParser:
                     include_sender_info=include_sender_info,
                     include_timestamp=include_timestamp,
                     max_nesting_depth=effective_max_depth,
-                    parse_context=parse_context,
+                    api_call_counter=api_call_counter,
                     depth=0,
                     debug_mode=debug_mode,
                 )
 
+                # 替换 Forward 组件为 Plain 纯文本
                 message_chain[idx] = Plain(text=formatted_text)
                 any_parsed = True
 
                 if debug_mode:
                     logger.info(
                         f"[转发消息] 已解析转发消息（{len(nodes)} 条节点），"
-                        f"API 调用次数: {parse_context['api_call_count']}"
+                        f"API 调用次数: {api_call_counter['count']}"
                     )
 
+            # 更新 message_str
             if any_parsed:
                 new_str_parts = []
                 for comp in message_chain:
                     if isinstance(comp, Plain):
                         if comp.text is not None:
-                            new_str_parts.append(str(comp.text))
+                            new_str_parts.append(comp.text)
                     else:
+                        # 保留其他组件的原始文本表示
                         new_str_parts.append(f"[{getattr(comp, 'type', 'Unknown')}]")
                 event.message_obj.message_str = " ".join(new_str_parts)
                 event.message_str = event.message_obj.message_str
@@ -158,22 +185,20 @@ class ForwardMessageParser:
             return False
 
 
-def _create_parse_context() -> dict[str, Any]:
-    return {
-        "api_call_count": 0,
-        "active_forward_ids": set(),
-        "forward_cache": {},
-    }
-
-
 def _get_call_action(event: AstrMessageEvent):
+    """
+    获取 event 上的 bot.call_action 方法。
+    仅 aiocqhttp 平台有此方法，其他平台返回 None。
+    """
     try:
         bot = getattr(event, "bot", None)
         if bot is None:
             return None
+        # aiocqhttp 的 bot 对象直接有 call_action
         call_action = getattr(bot, "call_action", None)
         if callable(call_action):
             return call_action
+        # 某些实现可能在 api 子对象上
         api = getattr(bot, "api", None)
         if api is not None:
             call_action = getattr(api, "call_action", None)
@@ -184,45 +209,24 @@ def _get_call_action(event: AstrMessageEvent):
         return None
 
 
-async def _get_forward_nodes_by_id(
-    call_action,
-    forward_id: str,
-    parse_context: dict[str, Any],
-    debug_mode: bool = False,
-) -> Optional[list]:
-    forward_id_str = str(forward_id).strip()
-    if not forward_id_str:
-        return None
-
-    forward_cache = parse_context["forward_cache"]
-    if forward_id_str in forward_cache:
-        if debug_mode:
-            logger.debug(f"[转发消息] 命中转发缓存，ID: {forward_id_str}")
-        return forward_cache[forward_id_str]
-
-    if parse_context["api_call_count"] >= FORWARD_API_CALL_HARD_LIMIT:
-        if debug_mode:
-            logger.debug(
-                f"[转发消息] API 调用次数已达上限，跳过获取转发内容，ID: {forward_id_str}"
-            )
-        forward_cache[forward_id_str] = None
-        return None
-
-    parse_context["api_call_count"] += 1
-    nodes = await _fetch_forward_nodes(call_action, forward_id_str, debug_mode)
-    forward_cache[forward_id_str] = nodes
-    return nodes
-
-
 async def _fetch_forward_nodes(
     call_action,
     forward_id: str,
     debug_mode: bool = False,
 ) -> Optional[list]:
+    """
+    调用 get_forward_msg API 获取转发消息节点列表。
+    兼容多种 OneBot 实现的参数格式和响应结构。
+
+    Returns:
+        节点列表 list[dict]，失败返回 None
+    """
+    # 尝试多种参数格式（不同 OneBot 实现可能使用不同参数名）
     params_list = [
         {"message_id": forward_id},
         {"id": forward_id},
     ]
+    # 如果 id 是纯数字，额外尝试整数格式
     forward_id_str = str(forward_id).strip()
     if forward_id_str.isdigit():
         int_id = int(forward_id_str)
@@ -244,63 +248,39 @@ async def _fetch_forward_nodes(
                 logger.debug(f"[转发消息] get_forward_msg 参数 {params} 失败: {e}")
             continue
 
-    # get_forward_msg failed — try get_msg as fallback.
-    # Nested forward IDs are often regular message IDs, not forward resource IDs.
-    for params in params_list:
-        try:
-            result = await call_action("get_msg", **params)
-            if isinstance(result, dict):
-                data = (
-                    result.get("data")
-                    if isinstance(result.get("data"), dict)
-                    else result
-                )
-                message = data.get("message")
-                if isinstance(message, list):
-                    sender = data.get("sender", {})
-                    msg_time = data.get("time", 0)
-                    return [{"sender": sender, "time": msg_time, "message": message}]
-        except Exception:
-            continue
-
-    if debug_mode:
-        logger.debug(
-            f"[转发消息] 所有 get_forward_msg / get_msg 尝试均失败，forward_id={forward_id}（将尝试 inline fallback）"
-        )
+    logger.warning(
+        f"[转发消息] 所有 get_forward_msg 尝试均失败，forward_id={forward_id}"
+    )
     return None
 
 
 def _extract_nodes_from_response(response: Any) -> Optional[list]:
+    """
+    从 get_forward_msg API 响应中提取节点列表。
+    兼容多种响应结构。
+    """
+    # 某些实现可能直接返回节点列表
     if isinstance(response, list) and len(response) > 0:
         return response
-
-    if isinstance(response, str):
-        parsed = _safe_json_loads(response)
-        if parsed is not None:
-            return _extract_nodes_from_response(parsed)
-        return None
 
     if not isinstance(response, dict):
         return None
 
+    # 尝试从 data 字段解包
     data = response.get("data")
     if isinstance(data, list) and len(data) > 0:
+        # 某些实现返回 {"data": [node1, node2, ...]}
         return data
+    if isinstance(data, dict):
+        search_target = data
+    else:
+        search_target = response
 
-    for target in (data, response):
-        if not isinstance(target, dict):
-            continue
-        for key in ("messages", "message", "nodes", "nodeList", "content"):
-            nodes = target.get(key)
-            if isinstance(nodes, list) and len(nodes) > 0:
-                return nodes
-        target_type = str(target.get("type", "")).lower()
-        if target_type in ("node", "nodes"):
-            nested_data = target.get("data")
-            if isinstance(nested_data, dict):
-                nested_nodes = _extract_inline_nodes_from_forward_segment(nested_data)
-                if nested_nodes is not None:
-                    return nested_nodes
+    # 尝试多种字段名
+    for key in ("messages", "message", "nodes", "nodeList"):
+        nodes = search_target.get(key)
+        if isinstance(nodes, list) and len(nodes) > 0:
+            return nodes
 
     return None
 
@@ -314,13 +294,34 @@ async def _format_forward_message(
     include_sender_info: bool,
     include_timestamp: bool,
     max_nesting_depth: int,
-    parse_context: dict[str, Any],
+    api_call_counter: dict,
     depth: int = 0,
     debug_mode: bool = False,
 ) -> str:
+    """
+    将转发消息节点格式化为可读纯文本。
+    支持嵌套转发的递归解析。
+
+    Args:
+        nodes: 消息节点列表
+        call_action: OneBot call_action 方法
+        forwarder_name: 转发者名字
+        forwarder_id: 转发者ID
+        event_timestamp: 事件时间戳
+        include_sender_info: 是否包含发送者信息
+        include_timestamp: 是否包含时间戳
+        max_nesting_depth: 最大嵌套深度
+        api_call_counter: API 调用计数器（共享字典 {"count": n}）
+        depth: 当前递归深度（0=最外层）
+        debug_mode: 调试模式
+
+    Returns:
+        格式化后的纯文本字符串
+    """
     indent = "  " * depth
     is_nested = depth > 0
 
+    # 构建头部
     label = "[嵌套转发消息]" if is_nested else "[转发消息]"
     header = _build_header(
         label,
@@ -332,10 +333,12 @@ async def _format_forward_message(
         is_nested=is_nested,
     )
 
+    # 构建分隔符
     sep_label = "嵌套转发" if is_nested else "转发"
     sep_start = f"{indent}--- {sep_label}内容 ---"
     sep_end = f"{indent}--- {sep_label}结束 ---"
 
+    # 解析每个节点
     body_lines = []
     for node in nodes:
         if not isinstance(node, dict):
@@ -347,7 +350,7 @@ async def _format_forward_message(
                 include_sender_info=include_sender_info,
                 include_timestamp=include_timestamp,
                 max_nesting_depth=max_nesting_depth,
-                parse_context=parse_context,
+                api_call_counter=api_call_counter,
                 depth=depth,
                 indent=indent,
                 debug_mode=debug_mode,
@@ -360,6 +363,7 @@ async def _format_forward_message(
             continue
 
     if not body_lines:
+        # 所有节点解析失败
         return f"{indent}{header}\n{sep_start}\n{indent}（转发内容为空或解析失败）\n{sep_end}"
 
     body = "\n".join(body_lines)
@@ -375,15 +379,27 @@ def _build_header(
     include_timestamp: bool,
     is_nested: bool = False,
 ) -> str:
+    """
+    构建转发消息的头部文本。
+
+    根据 include_sender_info 和 include_timestamp 配置：
+    - 两者都开：[时间戳] [转发消息] 由 名字(ID:xxx) 转发的消息：
+    - 只开sender：[转发消息] 由 名字(ID:xxx) 转发的消息：
+    - 只开时间戳：[时间戳] [转发消息]：
+    - 都关：[转发消息]：
+    """
     parts = []
 
+    # 时间戳部分
     if include_timestamp and timestamp and timestamp > 0:
         time_str = _format_timestamp(timestamp)
         if time_str:
             parts.append(f"[{time_str}]")
 
+    # 标签
     parts.append(label)
 
+    # 转发者信息
     if include_sender_info and (forwarder_name or forwarder_id):
         if forwarder_name:
             sender_str = f"{forwarder_name}(ID:{forwarder_id})"
@@ -402,17 +418,37 @@ async def _format_single_node(
     include_sender_info: bool,
     include_timestamp: bool,
     max_nesting_depth: int,
-    parse_context: dict[str, Any],
+    api_call_counter: dict,
     depth: int,
     indent: str,
     debug_mode: bool = False,
 ) -> Optional[str]:
-    normalized_node = _normalize_forward_node(node)
-    sender_name = normalized_node["sender_name"]
-    sender_id = normalized_node["sender_id"]
-    node_time = normalized_node["timestamp"]
-    segments = normalized_node["segments"]
+    """
+    格式化单个转发节点为文本行。
 
+    Returns:
+        格式化的文本行，或 None（无内容）
+    """
+    # 提取发送者信息
+    sender = node.get("sender") if isinstance(node.get("sender"), dict) else {}
+    sender_name = (
+        sender.get("nickname") or sender.get("card") or sender.get("user_id") or ""
+    )
+    sender_id = str(sender.get("user_id", ""))
+
+    # 提取时间戳
+    node_time = node.get("time", 0)
+    if not isinstance(node_time, (int, float)):
+        try:
+            node_time = int(node_time)
+        except (ValueError, TypeError):
+            node_time = 0
+
+    # 提取消息内容（兼容 message / content 字段）
+    raw_content = node.get("message") or node.get("content") or []
+    segments = _normalize_segments(raw_content)
+
+    # 解析 segments 为文本，同时检测嵌套转发
     text_parts = []
     nested_forward_texts = []
 
@@ -420,17 +456,27 @@ async def _format_single_node(
         if not isinstance(seg, dict):
             continue
 
-        seg_type = str(seg.get("type", "")).lower()
+        seg_type = seg.get("type", "")
         seg_data = seg.get("data", {}) if isinstance(seg.get("data"), dict) else {}
 
         if seg_type in ("text", "plain"):
             text = seg_data.get("text", "")
-            if isinstance(text, str) and text:
+            if text:
                 text_parts.append(text)
         elif seg_type == "image":
             text_parts.append("[图片]")
         elif seg_type == "video":
-            text_parts.append("[视频]")
+            # 🆕 提取视频URL，便于 videosummary 等插件从上下文中识别视频链接
+            video_url = (
+                seg_data.get("url")
+                or seg_data.get("file")
+                or seg_data.get("path")
+                or ""
+            )
+            if video_url:
+                text_parts.append(f"[视频](原始消息：{video_url})")
+            else:
+                text_parts.append("[视频]")
         elif seg_type == "record":
             text_parts.append("[语音]")
         elif seg_type == "file":
@@ -440,13 +486,18 @@ async def _format_single_node(
                 or seg_data.get("file")
                 or "文件"
             )
-            text_parts.append(f"[文件:{file_name}]")
+            # 🆕 提取文件URL，便于下游插件识别文件来源
+            file_url = seg_data.get("url") or ""
+            if file_url:
+                text_parts.append(f"[文件:{file_name}](原始消息：{file_url})")
+            else:
+                text_parts.append(f"[文件:{file_name}]")
         elif seg_type == "face":
             face_id = seg_data.get("id", "")
             text_parts.append(f"[表情:{face_id}]")
         elif seg_type == "at":
-            qq = seg_data.get("qq") or seg_data.get("user_id") or ""
-            name = seg_data.get("name") or seg_data.get("nickname") or ""
+            qq = seg_data.get("qq", "")
+            name = seg_data.get("name", "")
             if qq == "all":
                 text_parts.append("@全体成员")
             elif name:
@@ -454,7 +505,8 @@ async def _format_single_node(
             else:
                 text_parts.append(f"@{qq}")
         elif seg_type in ("forward", "forward_msg", "nodes"):
-            nested_text = await _handle_nested_forward_segment(
+            # 嵌套转发
+            nested_text = await _handle_nested_forward(
                 seg_data=seg_data,
                 call_action=call_action,
                 node_sender_name=sender_name,
@@ -463,28 +515,39 @@ async def _format_single_node(
                 include_sender_info=include_sender_info,
                 include_timestamp=include_timestamp,
                 max_nesting_depth=max_nesting_depth,
-                parse_context=parse_context,
+                api_call_counter=api_call_counter,
                 depth=depth,
                 debug_mode=debug_mode,
             )
             if nested_text:
                 nested_forward_texts.append(nested_text)
         elif seg_type == "json":
+            # JSON 消息（可能是小程序卡片等）
             raw_json = seg_data.get("data", "")
             if isinstance(raw_json, str) and raw_json.strip():
+                # 尝试解析为合并转发 JSON
                 multimsg_text = _try_parse_multimsg_json(raw_json)
                 if multimsg_text:
                     text_parts.append(multimsg_text)
                 else:
-                    text_parts.append("[JSON消息]")
+                    # 普通 JSON 卡片：提取 qqdocurl/url 等原始链接
+                    text_parts.append(
+                        format_json_card_message(raw_json, fallback="[JSON消息]")
+                    )
             else:
-                text_parts.append("[JSON消息]")
+                # 兼容 data 已经是 dict 的 OneBot 实现
+                text_parts.append(
+                    format_json_card_message(seg_data, fallback="[JSON消息]")
+                )
         else:
+            # 其他未知类型
             if seg_type:
                 text_parts.append(f"[{seg_type}]")
 
+    # 组合文本
     main_text = "".join(text_parts).strip()
 
+    # 构建行前缀
     line_prefix_parts = []
     if include_timestamp and node_time and node_time > 0:
         time_str = _format_timestamp(node_time)
@@ -505,7 +568,9 @@ async def _format_single_node(
         else:
             result_parts.append(f"{indent}{main_text}")
 
-    result_parts.extend(nested_forward_texts)
+    # 添加嵌套转发文本
+    for nested_text in nested_forward_texts:
+        result_parts.append(nested_text)
 
     if not result_parts:
         return None
@@ -513,7 +578,7 @@ async def _format_single_node(
     return "\n".join(result_parts)
 
 
-async def _handle_nested_forward_segment(
+async def _handle_nested_forward(
     seg_data: dict,
     call_action,
     node_sender_name: str,
@@ -522,264 +587,103 @@ async def _handle_nested_forward_segment(
     include_sender_info: bool,
     include_timestamp: bool,
     max_nesting_depth: int,
-    parse_context: dict[str, Any],
+    api_call_counter: dict,
     depth: int,
     debug_mode: bool = False,
 ) -> Optional[str]:
+    """
+    处理嵌套转发消息。
+
+    Returns:
+        嵌套转发的格式化文本，或 None
+    """
     new_depth = depth + 1
 
+    # 检查嵌套深度限制
     if new_depth > max_nesting_depth:
         indent = "  " * new_depth
         return f"{indent}[嵌套转发消息]（嵌套层级过深，已省略详细内容）"
 
-    nested_id = _extract_forward_id(seg_data)
-    if nested_id:
-        result = await _expand_nested_forward_by_id(
-            nested_id=nested_id,
-            call_action=call_action,
-            node_sender_name=node_sender_name,
-            node_sender_id=node_sender_id,
-            node_time=node_time,
-            include_sender_info=include_sender_info,
-            include_timestamp=include_timestamp,
-            max_nesting_depth=max_nesting_depth,
-            parse_context=parse_context,
-            depth=new_depth,
-            debug_mode=debug_mode,
-        )
-        if "（内容获取失败）" not in result:
-            return result
-        # get_forward_msg failed — fall through to try inline nodes
-    else:
-        result = None
-
-    nested_nodes = _extract_inline_nodes_from_forward_segment(seg_data)
-    if nested_nodes is not None:
-        return await _format_forward_message(
-            nodes=nested_nodes,
-            call_action=call_action,
-            forwarder_name=node_sender_name,
-            forwarder_id=node_sender_id,
-            event_timestamp=node_time,
-            include_sender_info=include_sender_info,
-            include_timestamp=include_timestamp,
-            max_nesting_depth=max_nesting_depth,
-            parse_context=parse_context,
-            depth=new_depth,
-            debug_mode=debug_mode,
-        )
-
-    logger.warning(
-        f"[转发消息] 嵌套转发解析失败：get_forward_msg 与 inline 回退均未获取到内容，"
-        f"nested_id={nested_id or 'N/A'}，已替换为占位标识"
-    )
-    if result is not None:
-        return result
-
-    indent = "  " * new_depth
-    return f"{indent}[嵌套转发消息]（无法获取内容）"
-
-
-async def _expand_nested_forward_by_id(
-    nested_id: str,
-    call_action,
-    node_sender_name: str,
-    node_sender_id: str,
-    node_time: int,
-    include_sender_info: bool,
-    include_timestamp: bool,
-    max_nesting_depth: int,
-    parse_context: dict[str, Any],
-    depth: int,
-    debug_mode: bool = False,
-) -> Optional[str]:
-    indent = "  " * depth
-    nested_id_str = str(nested_id).strip()
-    if not nested_id_str:
-        return f"{indent}[嵌套转发消息]（无法获取内容）"
-
-    active_forward_ids = parse_context["active_forward_ids"]
-    if nested_id_str in active_forward_ids:
-        return f"{indent}[嵌套转发消息]（检测到重复嵌套转发，已跳过重复展开）"
-
-    if (
-        nested_id_str not in parse_context["forward_cache"]
-        and parse_context["api_call_count"] >= FORWARD_API_CALL_HARD_LIMIT
-    ):
+    # 检查 API 调用次数限制
+    if api_call_counter["count"] >= FORWARD_API_CALL_HARD_LIMIT:
+        indent = "  " * new_depth
         return f"{indent}[嵌套转发消息]（API调用次数已达上限，已省略详细内容）"
 
-    nested_nodes = await _get_forward_nodes_by_id(
-        call_action,
-        nested_id_str,
-        parse_context,
-        debug_mode,
-    )
+    # 尝试获取嵌套转发 ID
+    nested_id = seg_data.get("id") or seg_data.get("message_id")
+    if not nested_id:
+        # 可能内容直接在 data.content 中（某些 OneBot 实现）
+        nested_content = seg_data.get("content")
+        if isinstance(nested_content, list):
+            # 直接解析内联节点
+            return await _format_forward_message(
+                nodes=nested_content,
+                call_action=call_action,
+                forwarder_name=node_sender_name,
+                forwarder_id=node_sender_id,
+                event_timestamp=node_time,
+                include_sender_info=include_sender_info,
+                include_timestamp=include_timestamp,
+                max_nesting_depth=max_nesting_depth,
+                api_call_counter=api_call_counter,
+                depth=new_depth,
+                debug_mode=debug_mode,
+            )
+        indent = "  " * new_depth
+        return f"{indent}[嵌套转发消息]（无法获取内容）"
+
+    # 调用 API 获取嵌套转发内容
+    api_call_counter["count"] += 1
+    nested_nodes = await _fetch_forward_nodes(call_action, str(nested_id), debug_mode)
+
     if nested_nodes is None:
+        indent = "  " * new_depth
         return f"{indent}[嵌套转发消息]（内容获取失败）"
 
-    active_forward_ids.add(nested_id_str)
-    try:
-        return await _format_forward_message(
-            nodes=nested_nodes,
-            call_action=call_action,
-            forwarder_name=node_sender_name,
-            forwarder_id=node_sender_id,
-            event_timestamp=node_time,
-            include_sender_info=include_sender_info,
-            include_timestamp=include_timestamp,
-            max_nesting_depth=max_nesting_depth,
-            parse_context=parse_context,
-            depth=depth,
-            debug_mode=debug_mode,
-        )
-    finally:
-        active_forward_ids.discard(nested_id_str)
-
-
-def _normalize_forward_node(node: dict[str, Any]) -> dict[str, Any]:
-    candidate = dict(node)
-    inner_data = node.get("data") if isinstance(node.get("data"), dict) else None
-    if str(node.get("type", "")).lower() == "node" and inner_data:
-        merged = dict(inner_data)
-        for key in ("sender", "time", "timestamp", "message", "content"):
-            if key in node and key not in merged:
-                merged[key] = node[key]
-        candidate = merged
-    elif inner_data and not any(
-        key in node for key in ("sender", "message", "content", "nickname", "user_id")
-    ):
-        candidate = dict(inner_data)
-
-    sender_name, sender_id = _extract_sender_info(candidate)
-    timestamp = _extract_node_timestamp(candidate)
-    raw_content = candidate.get("message")
-    if raw_content is None:
-        raw_content = candidate.get("content")
-    segments = _normalize_segments(raw_content)
-
-    return {
-        "sender_name": sender_name,
-        "sender_id": sender_id,
-        "timestamp": timestamp,
-        "segments": segments,
-    }
-
-
-def _extract_sender_info(node: dict[str, Any]) -> tuple[str, str]:
-    sender = node.get("sender") if isinstance(node.get("sender"), dict) else {}
-
-    sender_name = (
-        sender.get("nickname")
-        or sender.get("card")
-        or sender.get("name")
-        or node.get("nickname")
-        or node.get("name")
-        or node.get("user_name")
-        or ""
-    )
-    sender_id = (
-        sender.get("user_id")
-        or sender.get("uin")
-        or sender.get("id")
-        or sender.get("qq")
-        or node.get("user_id")
-        or node.get("uin")
-        or node.get("id")
-        or node.get("qq")
-        or ""
+    # 递归格式化
+    return await _format_forward_message(
+        nodes=nested_nodes,
+        call_action=call_action,
+        forwarder_name=node_sender_name,
+        forwarder_id=node_sender_id,
+        event_timestamp=node_time,
+        include_sender_info=include_sender_info,
+        include_timestamp=include_timestamp,
+        max_nesting_depth=max_nesting_depth,
+        api_call_counter=api_call_counter,
+        depth=new_depth,
+        debug_mode=debug_mode,
     )
 
-    return str(sender_name or ""), str(sender_id or "")
 
-
-def _extract_node_timestamp(node: dict[str, Any]) -> int:
-    node_time = node.get("time")
-    if node_time is None:
-        node_time = node.get("timestamp")
-    if node_time is None:
-        node_time = node.get("date")
-    if isinstance(node_time, (int, float)):
-        return int(node_time)
-    try:
-        return int(node_time)
-    except (ValueError, TypeError):
-        return 0
-
-
-def _normalize_segments(raw_content: Any) -> list:
+def _normalize_segments(raw_content) -> list:
+    """
+    将各种格式的消息内容统一为 segment 列表。
+    兼容 list[dict]、str (JSON)、str (纯文本) 格式。
+    """
     if isinstance(raw_content, list):
         return raw_content
-    if isinstance(raw_content, dict):
-        if raw_content.get("type"):
-            return [raw_content]
-        nested = _extract_inline_nodes_from_forward_segment(raw_content)
-        if nested is not None:
-            return [{"type": "nodes", "data": {"content": nested}}]
     if isinstance(raw_content, str):
         raw_content = raw_content.strip()
         if not raw_content:
             return []
-        parsed = _safe_json_loads(raw_content)
-        if parsed is not None:
-            normalized = _normalize_segments(parsed)
-            if normalized:
-                return normalized
+        # 尝试解析为 JSON
+        try:
+            parsed = json.loads(raw_content)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+        # 纯文本
         return [{"type": "text", "data": {"text": raw_content}}]
     return []
 
 
-def _extract_forward_id(seg_data: dict[str, Any]) -> str:
-    nested_id = seg_data.get("id") or seg_data.get("message_id")
-    if nested_id is None:
-        return ""
-    return str(nested_id).strip()
-
-
-def _extract_inline_nodes_from_forward_segment(seg_data: Any) -> Optional[list]:
-    if isinstance(seg_data, list):
-        return seg_data
-
-    if isinstance(seg_data, str):
-        parsed = _safe_json_loads(seg_data)
-        if parsed is not None:
-            return _extract_inline_nodes_from_forward_segment(parsed)
-        return None
-
-    if not isinstance(seg_data, dict):
-        return None
-
-    for key in ("content", "messages", "nodes", "nodeList", "message"):
-        nested = seg_data.get(key)
-        if isinstance(nested, list):
-            return nested
-        if isinstance(nested, str):
-            parsed = _safe_json_loads(nested)
-            if parsed is not None:
-                extracted = _extract_inline_nodes_from_forward_segment(parsed)
-                if extracted is not None:
-                    return extracted
-        if isinstance(nested, dict):
-            extracted = _extract_inline_nodes_from_forward_segment(nested)
-            if extracted is not None:
-                return extracted
-
-    nested_data = seg_data.get("data")
-    if nested_data is not None:
-        extracted = _extract_inline_nodes_from_forward_segment(nested_data)
-        if extracted is not None:
-            return extracted
-
-    return None
-
-
-def _safe_json_loads(raw: str) -> Any:
-    try:
-        return json.loads(raw)
-    except Exception:
-        return None
-
-
 def _format_timestamp(unix_timestamp: int) -> str:
+    """
+    将 Unix 时间戳格式化为可读字符串。
+    格式：YYYY-MM-DD 星期几 HH:MM:SS（与插件其他部分保持一致）
+    """
     try:
         if not unix_timestamp or unix_timestamp <= 0:
             return ""
@@ -792,7 +696,12 @@ def _format_timestamp(unix_timestamp: int) -> str:
 
 
 def _try_parse_multimsg_json(raw_json: str) -> Optional[str]:
+    """
+    尝试从 JSON 消息中解析合并转发的摘要信息。
+    QQ 的合并转发有时以 com.tencent.multimsg JSON 格式出现。
+    """
     try:
+        # 处理 HTML 实体
         raw_json = raw_json.replace("&#44;", ",")
         parsed = json.loads(raw_json)
         if not isinstance(parsed, dict):

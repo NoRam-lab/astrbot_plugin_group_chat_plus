@@ -3,22 +3,15 @@
 负责提取和提醒AI当前可用的工具
 
 作者: Him666233
-版本: V1.2.3.hotfix.1
+版本: v1.2.1
 """
 
-from typing import List, Dict, Optional, Any
-
-from astrbot.api import logger
+from collections.abc import Iterable
+from typing import Any, List, Dict, Optional
 from astrbot.api.all import *
-from astrbot.api.event import AstrMessageEvent
-from astrbot.core.star.context import Context
-from astrbot.core.star.star import star_map
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
-
-TOOL_REMINDER_START_MARKER = "[系统提示-工具提醒开始]"
-TOOL_REMINDER_END_MARKER = "[系统提示-工具提醒结束]"
 
 
 class ToolsReminder:
@@ -32,149 +25,91 @@ class ToolsReminder:
     """
 
     @staticmethod
-    def _extract_tools_from_container(tool_container: Any) -> List[Any]:
-        """从兼容容器中提取工具列表。"""
-        if not tool_container:
+    def _extract_tools(tool_source: Any) -> List[Any]:
+        """
+        从 ToolSet、FunctionToolManager 或普通工具列表中提取工具对象列表
+        """
+        if not tool_source:
             return []
 
-        tools = getattr(tool_container, "tools", None)
-        if tools is not None:
-            return list(tools)
+        if hasattr(tool_source, "tools"):
+            return list(getattr(tool_source, "tools") or [])
 
-        func_list = getattr(tool_container, "func_list", None)
-        if func_list is not None:
-            return list(func_list)
+        if hasattr(tool_source, "func_list"):
+            return list(getattr(tool_source, "func_list") or [])
+
+        if isinstance(tool_source, Iterable) and not isinstance(
+            tool_source, (str, bytes, dict)
+        ):
+            return list(tool_source)
 
         return []
 
     @staticmethod
-    def filter_tools_by_current_session(
-        tool_container: Any, event: AstrMessageEvent
-    ) -> List[Any]:
-        """按当前会话插件集过滤工具，仅用于提醒层展示。"""
-        tools = ToolsReminder._extract_tools_from_container(tool_container)
-        if not tools:
-            return []
+    def _tool_to_info(tool: Any) -> Optional[Dict]:
+        """
+        将单个工具对象转换为提醒中使用的字典结构
+        """
+        if not getattr(tool, "active", True):
+            return None
 
-        plugins_name = getattr(event, "plugins_name", None)
-        if plugins_name is None:
-            return tools
+        tool_name = getattr(tool, "name", None) or "未命名工具"
+        tool_info = {
+            "name": tool_name,
+            "description": getattr(tool, "description", "无描述"),
+            "parameters": [],
+        }
 
-        filtered_tools = []
-        for tool in tools:
-            handler_module_path = getattr(tool, "handler_module_path", None)
-            if not handler_module_path:
-                filtered_tools.append(tool)
-                continue
+        # 尝试获取参数信息
+        if hasattr(tool, "parameters"):
+            try:
+                params = tool.parameters
+                if isinstance(params, dict) and "properties" in params:
+                    # parameters是对象格式，提取properties
+                    for param_name, param_info in params["properties"].items():
+                        param_desc = {
+                            "name": param_name,
+                            "type": param_info.get("type", "unknown"),
+                            "description": param_info.get("description", ""),
+                        }
+                        tool_info["parameters"].append(param_desc)
+            except Exception as e:
+                logger.warning(f"获取工具 {tool_name} 的参数信息失败: {e}")
 
-            plugin = star_map.get(handler_module_path)
-            if not plugin:
-                filtered_tools.append(tool)
-                continue
-
-            if plugin.reserved or plugin.name in plugins_name:
-                filtered_tools.append(tool)
-
-        return filtered_tools
+        return tool_info
 
     @staticmethod
-    def tools_to_info(
-        tool_container: Any,
-        allowed_tool_names: Optional[List[str]] = None,
-        event: AstrMessageEvent | None = None,
-    ) -> List[Dict]:
-        """将最终工具容器转换为可提醒的工具信息列表。"""
+    def get_available_tools_from_source(tool_source: Any) -> List[Dict]:
+        """
+        从最终 ToolSet 或工具对象列表中获取可提醒的工具信息
+
+        只保留 active 工具，并按名称去重。若同名 active 工具重复出现，
+        后出现的工具覆盖前面的信息，与 AstrBot ToolSet.add_tool 行为保持一致。
+        """
         try:
-            raw_tools = (
-                ToolsReminder.filter_tools_by_current_session(tool_container, event)
-                if event is not None
-                else ToolsReminder._extract_tools_from_container(tool_container)
-            )
-            if not raw_tools:
-                return []
+            tools = ToolsReminder._extract_tools(tool_source)
+            tool_map: Dict[str, Dict] = {}
+            order: List[str] = []
 
-            allowed_set = (
-                {str(name) for name in allowed_tool_names}
-                if allowed_tool_names is not None
-                else None
-            )
-
-            tool_list = []
-            for tool in raw_tools:
-                tool_name = getattr(tool, "name", "未命名工具")
-                if allowed_set is not None and tool_name not in allowed_set:
+            for tool in tools:
+                tool_info = ToolsReminder._tool_to_info(tool)
+                if not tool_info:
                     continue
 
-                if hasattr(tool, "active") and not getattr(tool, "active", True):
-                    continue
+                name = tool_info["name"]
+                if name not in tool_map:
+                    order.append(name)
+                tool_map[name] = tool_info
 
-                tool_info = {
-                    "name": tool_name,
-                    "description": getattr(tool, "description", "无描述"),
-                    "parameters": [],
-                }
+            tool_list = [tool_map[name] for name in order if name in tool_map]
 
-                if hasattr(tool, "parameters"):
-                    try:
-                        params = tool.parameters
-                        if isinstance(params, dict) and "properties" in params:
-                            for param_name, param_info in params["properties"].items():
-                                tool_info["parameters"].append(
-                                    {
-                                        "name": param_name,
-                                        "type": param_info.get("type", "unknown"),
-                                        "description": param_info.get(
-                                            "description", ""
-                                        ),
-                                    }
-                                )
-                    except Exception as e:
-                        logger.warning(f"获取工具 {tool_name} 的参数信息失败: {e}")
-
-                tool_list.append(tool_info)
-
+            if DEBUG_MODE:
+                logger.info(f"从最终工具集获取到 {len(tool_list)} 个可用工具")
             return tool_list
+
         except Exception as e:
-            logger.error(f"从工具容器提取工具信息失败: {e}")
+            logger.error(f"从工具集获取可用工具时发生错误: {e}")
             return []
-
-    @staticmethod
-    def build_tools_reminder_message(
-        original_message: str,
-        tool_container: Any,
-        allowed_tool_names: Optional[List[str]] = None,
-        event: AstrMessageEvent | None = None,
-        include_parameters: bool = True,
-    ) -> str:
-        """基于当前会话最终工具集构建提醒文本。"""
-        try:
-            tools = ToolsReminder.tools_to_info(
-                tool_container, allowed_tool_names, event
-            )
-            if not tools:
-                if DEBUG_MODE:
-                    logger.info("没有可用工具,跳过工具提醒")
-                return original_message
-
-            tools_info = ToolsReminder.format_tools_info(
-                tools, include_parameters=include_parameters
-            )
-            injected_message = (
-                original_message
-                + "\n\n"
-                + TOOL_REMINDER_START_MARKER
-                + "\n=== 可用工具列表 ===\n"
-                + tools_info
-                + "\n"
-                + TOOL_REMINDER_END_MARKER
-            )
-            injected_message += (
-                "\n(以上是当前会话中你可以调用的所有工具,根据需要选择合适的工具使用)"
-            )
-            return injected_message
-        except Exception as e:
-            logger.error(f"构建工具提醒文本时发生错误: {e}")
-            return original_message
 
     @staticmethod
     def get_available_tools(context: Context) -> List[Dict]:
@@ -196,42 +131,13 @@ class ToolsReminder:
                 logger.warning("无法获取LLM工具管理器")
                 return []
 
-            # 同时兼容 FunctionToolManager(.func_list) 与 ToolSet(.tools)
-            tools = getattr(tool_manager, "func_list", None)
-            if tools is None:
-                tools = getattr(tool_manager, "tools", None)
-            if tools is None and hasattr(tool_manager, "get_full_tool_set"):
-                tool_set = tool_manager.get_full_tool_set()
-                tools = getattr(tool_set, "tools", [])
+            # 优先使用 AstrBot 的完整工具集接口，确保同名工具覆盖与 active 状态处理一致
+            try:
+                tool_source = tool_manager.get_full_tool_set()
+            except Exception:
+                tool_source = tool_manager.func_list
 
-            tool_list = []
-            for tool in tools:
-                tool_info = {
-                    "name": getattr(tool, "name", "未命名工具"),
-                    "description": getattr(tool, "description", "无描述"),
-                    "parameters": [],
-                }
-
-                # 尝试获取参数信息
-                if hasattr(tool, "parameters"):
-                    try:
-                        params = tool.parameters
-                        if isinstance(params, dict) and "properties" in params:
-                            # parameters是对象格式，提取properties
-                            for param_name, param_info in params["properties"].items():
-                                param_desc = {
-                                    "name": param_name,
-                                    "type": param_info.get("type", "unknown"),
-                                    "description": param_info.get("description", ""),
-                                }
-                                tool_info["parameters"].append(param_desc)
-                    except Exception as e:
-                        logger.warning(
-                            f"获取工具 {tool_info['name']} 的参数信息失败: {e}"
-                        )
-
-                tool_list.append(tool_info)
-
+            tool_list = ToolsReminder.get_available_tools_from_source(tool_source)
             if DEBUG_MODE:
                 logger.info(f"获取到 {len(tool_list)} 个可用工具")
             return tool_list
@@ -241,13 +147,12 @@ class ToolsReminder:
             return []
 
     @staticmethod
-    def format_tools_info(tools: List[Dict], include_parameters: bool = True) -> str:
+    def format_tools_info(tools: List[Dict]) -> str:
         """
         格式化工具列表为可读文本
 
         Args:
             tools: 工具信息列表
-            include_parameters: 是否包含参数列表
 
         Returns:
             格式化后的文本
@@ -263,7 +168,8 @@ class ToolsReminder:
             formatted_parts.append(f"{idx}. 工具名称: {tool['name']}")
             formatted_parts.append(f"   功能描述: {tool['description']}")
 
-            if include_parameters and tool.get("parameters"):
+            # 如果有参数信息,也列出来
+            if tool.get("parameters"):
                 formatted_parts.append("   参数:")
                 for param in tool["parameters"]:
                     param_line = f"     - {param['name']} ({param['type']})"
@@ -349,7 +255,7 @@ class ToolsReminder:
         original_message: str,
         context: Context,
         allowed_tool_names: Optional[List[str]] = None,
-        include_parameters: bool = True,
+        tool_source: Any = None,
     ) -> str:
         """
         将工具信息注入到消息
@@ -358,14 +264,22 @@ class ToolsReminder:
             original_message: 原始消息
             context: Context对象
             allowed_tool_names: 允许的工具名称列表，None表示不过滤
-            include_parameters: 是否包含参数列表
+            tool_source: 最终工具集或工具列表，优先使用；为空时回退到context
 
         Returns:
             注入工具信息后的文本
         """
         try:
+            if "=== 可用工具列表 ===" in original_message:
+                if DEBUG_MODE:
+                    logger.info("消息中已存在工具提醒,跳过重复注入")
+                return original_message
+
             # 获取工具列表
-            tools = ToolsReminder.get_available_tools(context)
+            if tool_source is not None:
+                tools = ToolsReminder.get_available_tools_from_source(tool_source)
+            else:
+                tools = ToolsReminder.get_available_tools(context)
 
             # 按人格配置过滤工具
             if allowed_tool_names is not None:
@@ -379,9 +293,7 @@ class ToolsReminder:
                 return original_message
 
             # 格式化工具信息
-            tools_info = ToolsReminder.format_tools_info(
-                tools, include_parameters=include_parameters
-            )
+            tools_info = ToolsReminder.format_tools_info(tools)
 
             # 注入到消息中
             injected_message = (

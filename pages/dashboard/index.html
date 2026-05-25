@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GCP 上下文管理</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>GCP 上下文管理</h1>
+          <p>管理 Group Chat Plus 自有 SQLite 短期上下文</p>
+        </div>
+        <div class="actions">
+          <button id="maintenance-btn" class="btn secondary" type="button">维护归档</button>
+          <button id="refresh-btn" class="btn primary" type="button">刷新</button>
+        </div>
+      </header>
+
+      <section class="stats-grid" aria-label="运行状态">
+        <article class="stat-card">
+          <span>热库消息</span>
+          <strong id="stat-hot">--</strong>
+        </article>
+        <article class="stat-card">
+          <span>冷库消息</span>
+          <strong id="stat-cold">--</strong>
+        </article>
+        <article class="stat-card">
+          <span>已软删</span>
+          <strong id="stat-deleted">--</strong>
+        </article>
+        <article class="stat-card">
+          <span>图片成功</span>
+          <strong id="stat-image-success">--</strong>
+        </article>
+        <article class="stat-card">
+          <span>待补救</span>
+          <strong id="stat-image-pending">--</strong>
+        </article>
+        <article class="stat-card">
+          <span>最终失败</span>
+          <strong id="stat-image-failed">--</strong>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="filters">
+          <input id="keyword-input" class="input" type="search" placeholder="关键词 / message_id / sender" />
+          <input id="platform-input" class="input" type="text" placeholder="platform_id" />
+          <input id="chat-input" class="input" type="text" placeholder="chat_id / 群号" />
+          <select id="db-select" class="input">
+            <option value="hot">热库</option>
+            <option value="cold">冷库</option>
+            <option value="all">全部</option>
+          </select>
+          <select id="role-select" class="input">
+            <option value="">全部角色</option>
+            <option value="user">user</option>
+            <option value="assistant">assistant</option>
+            <option value="bot">bot</option>
+          </select>
+          <select id="image-status-select" class="input">
+            <option value="">全部图片状态</option>
+            <option value="success">success</option>
+            <option value="pending_retry">pending_retry</option>
+            <option value="failed_final">failed_final</option>
+          </select>
+          <input id="source-input" class="input" type="text" placeholder="trigger_source" />
+          <label class="check">
+            <input id="include-deleted-input" type="checkbox" />
+            显示已删除
+          </label>
+        </div>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="table-toolbar">
+          <div id="result-summary">等待加载</div>
+          <button id="batch-delete-btn" class="btn danger" type="button">批量软删除</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th><input id="select-all" type="checkbox" /></th>
+                <th>时间</th>
+                <th>库</th>
+                <th>群</th>
+                <th>发送者</th>
+                <th>角色</th>
+                <th>内容</th>
+                <th>图片</th>
+                <th>来源</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="messages-body"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button id="prev-page" class="btn secondary" type="button">上一页</button>
+          <span id="page-label">第 1 页</span>
+          <button id="next-page" class="btn secondary" type="button">下一页</button>
+        </div>
+      </section>
+
+      <section id="error-panel" class="error-panel hidden"></section>
+    </main>
+
+    <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <header class="modal-header">
+          <h2>编辑上下文消息</h2>
+          <button id="modal-close" class="icon-btn" type="button">x</button>
+        </header>
+        <div class="modal-body">
+          <div class="meta-grid" id="modal-meta"></div>
+          <label>
+            内容
+            <textarea id="edit-content" rows="8"></textarea>
+          </label>
+          <label>
+            发送者昵称
+            <input id="edit-sender" class="input" type="text" />
+          </label>
+          <label>
+            图片状态
+            <input id="edit-image-status" class="input" type="text" />
+          </label>
+          <label>
+            图片说明（一行一个）
+            <textarea id="edit-image-descriptions" rows="4"></textarea>
+          </label>
+          <label>
+            修改原因
+            <input id="edit-reason" class="input" type="text" placeholder="可选" />
+          </label>
+          <details>
+            <summary>图片引用与 raw 信息</summary>
+            <pre id="raw-json"></pre>
+          </details>
+        </div>
+        <footer class="modal-actions">
+          <button id="restore-btn" class="btn secondary" type="button">恢复</button>
+          <button id="soft-delete-btn" class="btn danger" type="button">软删除</button>
+          <button id="save-btn" class="btn primary" type="button">保存</button>
+        </footer>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>
