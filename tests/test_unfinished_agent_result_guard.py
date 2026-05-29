@@ -18,9 +18,22 @@ class FakeEvent:
         self._result = result
         self.clear_count = 0
         self.message_obj = SimpleNamespace(message_id=message_id)
+        self.call_llm = False
 
     def get_platform_name(self):
         return "aiocqhttp"
+
+    def get_platform_id(self):
+        return "bot1"
+
+    def is_private_chat(self):
+        return False
+
+    def get_group_id(self):
+        return "group-1"
+
+    def get_sender_id(self):
+        return "user-1"
 
     def get_result(self):
         return self._result
@@ -43,6 +56,21 @@ def make_plugin(*, enabled=True, processing=True, done=False):
     plugin._agent_done_flags = {message_id} if done else set()
     plugin._pending_bot_replies = {}
     plugin.raw_reply_cache = {}
+    plugin.recent_replies_cache = {}
+    plugin.enable_duplicate_filter = False
+    plugin.enable_duplicate_time_limit = False
+    plugin.duplicate_filter_time_limit = 60
+    plugin.duplicate_filter_check_count = 5
+    plugin._DUPLICATE_CACHE_SIZE_LIMIT = 100
+    plugin.content_filter = SimpleNamespace(
+        process_for_output=lambda text: text,
+        process_for_save=lambda text: text,
+    )
+    plugin.typing_simulator_enabled = False
+    plugin.typing_simulator = None
+    plugin._active_reply_flows = {}
+    plugin._superseded_reply_message_ids = set()
+    plugin._superseded_reply_flow_times = {}
     return plugin
 
 
@@ -110,3 +138,23 @@ def test_guard_clears_unfinished_llm_result_even_after_image_decoration():
 
     assert event.get_result() is None
     assert event.clear_count == 1
+
+
+def test_decorating_result_clears_superseded_reply():
+    message_id = "aiocqhttp_msg-1"
+    plugin = make_plugin(processing=True, done=True)
+    plugin._superseded_reply_message_ids.add(message_id)
+    plugin._superseded_reply_flow_times[message_id] = 123.0
+    plugin._active_reply_flows[message_id] = {
+        "runtime_chat_key": "bot1:group:group-1:group-1",
+        "stage": "reply_generate",
+    }
+    event = FakeEvent(FakeResult())
+
+    run(plugin.on_decorating_result(event))
+
+    assert event.get_result() is None
+    assert event.clear_count == 1
+    assert plugin.raw_reply_cache == {}
+    assert plugin._pending_bot_replies == {}
+    assert message_id not in plugin._active_reply_flows

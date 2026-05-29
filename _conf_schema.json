@@ -84,7 +84,7 @@
         "description": "读空气AI额外提示词",
         "type": "text",
         "hint": "给「判断是否回复」的AI填写自定义提示词。\n\n• append模式：此处内容追加在默认提示词后面，可只写补充说明，留空则完全沿用默认提示词\n• override模式：此处内容完全替换默认提示词，需自行包含所有判断逻辑（最终只输出yes或no）\n\n提示：override模式下建议参照下方「📋 读空气AI 默认系统提示词」的完整内容，在其基础上修改，而非从零编写。",
-        "default": "",
+        "default": "请先完整理解当前群聊上下文，再判断是否回复当前新消息。\n\n不要因为消息看起来有趣、出现关键词、或与你的人格相关就立刻回复。先确认当前发送者是在对你说话，还是在和别人聊天；当前话题和群聊氛围是否适合你自然插话；你的回复是否能推进对话、缓和气氛、补充有价值内容，或自然接住对方。\n\n如果当前消息主要是他人之间的对话、低信息量附和、普通表情/表情包、@别人、引用别人、或你无法理解上下文含义，倾向于 no。\n\n但如果当前消息明确邀请你参与、直接问你、与你之前的回复有关、有清楚的新问题，或你能以符合人格的方式自然接住当前话题，可以输出 yes。\n\n如果短时间内你已经回复较多，或看到[系统信息-回复密度]提示你最近发言频繁，除非当前消息明确需要你回应、直接问你、或非常适合你参与，否则输出 no。\n\n最终只输出 yes 或 no。",
         "promptDataRef": "decision-ai"
       },
       "decision_ai_timeout": {
@@ -104,6 +104,36 @@
         "type": "list",
         "hint": "列表中的用户发送普通消息时，插件只记录消息，不主动走概率筛选、读空气AI判断或主动回复。@机器人、引用回复机器人消息和触发关键词不受影响。留空=不启用。",
         "default": []
+      },
+      "enable_reply_silent_blacklist": {
+        "description": "启用回复硬静默名单",
+        "type": "bool",
+        "hint": "开启后，下方名单中的用户消息仍会正常写入GCP上下文，包括按现有配置处理图片描述，但不会触发本插件回复。此功能只影响Group Chat Plus，不拦截其他插件或AstrBot官方回复。",
+        "default": false
+      },
+      "reply_silent_blacklist_user_ids": {
+        "description": "回复硬静默用户ID列表",
+        "type": "list",
+        "hint": "这些用户的消息会照常记录到GCP SQLite上下文，但本插件不会因为这些消息回复。留空不生效；如果同一用户也在回复降概率名单中，硬静默优先生效。",
+        "default": []
+      },
+      "enable_reply_probability_blacklist": {
+        "description": "启用回复降概率名单",
+        "type": "bool",
+        "hint": "开启后，下方名单中的用户消息仍会正常写入GCP上下文；当消息本来会继续触发回复时，再按下方概率决定是否允许本插件回复。@机器人、关键词和引用回复也会经过这道最终门控。",
+        "default": false
+      },
+      "reply_probability_blacklist_user_ids": {
+        "description": "回复降概率用户ID列表",
+        "type": "list",
+        "hint": "这些用户的消息照常记录，但本插件最终是否回复会受回复降概率控制。留空不生效。",
+        "default": []
+      },
+      "reply_probability_blacklist_rate": {
+        "description": "回复降概率名单允许回复概率",
+        "type": "float",
+        "hint": "范围0-1。0表示名单用户永不触发本插件回复，1表示不额外降低，0.2表示原本会回复时只有20%继续回复。启动时会自动限制到0-1范围。",
+        "default": 0.2
       },
       "suppress_unfinished_agent_llm_results": {
         "description": "拦截未完成Agent中间回复",
@@ -314,6 +344,12 @@
         "hint": "【插件自有图片理解主开关】开启后，插件会在自己的上下文链路中把图片转换为文字描述。通过概率筛选、概率过滤未回复、等待窗口缓冲等群聊消息都尽量走同一套插件图片转写逻辑；官方自动理解图片不是主路径。",
         "default": false
       },
+      "enable_reply_multimodal_image_mode": {
+        "description": "🖼️ 回复时直传本轮原图",
+        "type": "bool",
+        "hint": "开启后，读空气判断和最终回复会额外把本轮相关原图直接传给 LLM。图片范围仅包括当前触发消息和群聊等待窗口吸收的后续消息，不上传历史上下文或 SQLite 旧消息中的图片。图片转文字结果仍会作为兜底文字保留在提示词中。",
+        "default": false
+      },
       "image_to_text_scope": {
         "description": "图片转文字应用范围",
         "type": "string",
@@ -354,7 +390,7 @@
       "max_images_per_message": {
         "description": "🖼️ 单条消息最大处理图片数",
         "type": "int",
-        "hint": "单条消息最多处理多少张图片。超出的图片将被忽略（用占位符替代）。防止有人恶意发送大量图片导致AI调用费用暴增。建议5-20张，默认10张",
+        "hint": "单条消息最多处理多少张图片。超出的图片将被忽略（用占位符替代）。开启「回复时直传本轮原图」后，此项也作为单次 LLM 请求直传原图的总上限（当前触发消息优先，再追加等待窗口消息）。防止有人恶意发送大量图片导致AI调用费用暴增。建议5-20张，默认10张",
         "default": 10
       },
       "active_image_understanding_blacklist_user_ids": {

@@ -90,6 +90,9 @@ def make_plugin():
     plugin.group_wait_window_timeout_ms = 1
     plugin.group_wait_window_max_users = 5
     plugin._group_wait_window_max_extra = 3
+    plugin._active_reply_flows = {}
+    plugin._superseded_reply_message_ids = set()
+    plugin._superseded_reply_flow_times = {}
     return plugin
 
 
@@ -311,3 +314,95 @@ def test_parallel_wait_windows_for_same_user_do_not_replace_each_other():
         await asyncio.gather(task_a, task_b)
 
     asyncio.run(run())
+
+
+def test_strong_trigger_supersedes_prior_same_runtime_flow():
+    async def run():
+        plugin = make_plugin()
+        plugin.wait_window_buffer = FakeWaitWindowBuffer(["scope-a:window:old"])
+        plugin._group_wait_windows = {
+            ("scope-a", "message:msg-old"): {
+                "buffer_key": "scope-a:window:old",
+                "force_complete": False,
+            },
+            ("scope-b", "message:msg-other"): {
+                "buffer_key": "scope-b:window:other",
+                "force_complete": False,
+            },
+        }
+        plugin._register_reply_flow(
+            "msg-old",
+            "scope-a",
+            trigger_kind="normal",
+            sender_id="10001",
+            stage="wait_window",
+            buffer_key="scope-a:window:old",
+        )
+        plugin._register_reply_flow(
+            "msg-current",
+            "scope-a",
+            trigger_kind="at",
+            sender_id="10001",
+            stage="trigger_check",
+        )
+        plugin._register_reply_flow(
+            "msg-other",
+            "scope-b",
+            trigger_kind="normal",
+            sender_id="10001",
+            stage="wait_window",
+            buffer_key="scope-b:window:other",
+        )
+        plugin._register_reply_flow(
+            "msg-later",
+            "scope-a",
+            trigger_kind="normal",
+            sender_id="10001",
+            stage="trigger_check",
+        )
+        plugin._register_reply_flow(
+            "msg-strong-old",
+            "scope-a",
+            trigger_kind="at",
+            sender_id="10001",
+            stage="reply_generate",
+            buffer_key="scope-a:window:strong",
+        )
+        plugin._active_reply_flows["msg-old"]["started_at"] = 10.0
+        plugin._active_reply_flows["msg-current"]["started_at"] = 20.0
+        plugin._active_reply_flows["msg-other"]["started_at"] = 10.0
+        plugin._active_reply_flows["msg-later"]["started_at"] = 30.0
+        plugin._active_reply_flows["msg-strong-old"]["started_at"] = 10.0
+
+        victims = await plugin._supersede_prior_reply_flows(
+            "scope-a", "msg-current", reason="at"
+        )
+
+        assert victims == ["msg-old"]
+        assert plugin._is_reply_flow_superseded("msg-old") is True
+        assert plugin._is_reply_flow_superseded("msg-current") is False
+        assert plugin._is_reply_flow_superseded("msg-other") is False
+        assert plugin._is_reply_flow_superseded("msg-later") is False
+        assert plugin._is_reply_flow_superseded("msg-strong-old") is False
+        assert plugin._group_wait_windows[("scope-a", "message:msg-old")][
+            "force_complete"
+        ] is True
+        assert plugin._group_wait_windows[("scope-b", "message:msg-other")][
+            "force_complete"
+        ] is False
+        assert plugin.wait_window_buffer.cleared == ["scope-a:window:old"]
+
+    asyncio.run(run())
+
+
+def test_finish_reply_flow_clears_supersede_state():
+    plugin = make_plugin()
+    plugin._register_reply_flow("msg-old", "scope-a")
+    plugin._superseded_reply_message_ids.add("msg-old")
+    plugin._superseded_reply_flow_times["msg-old"] = 123.0
+
+    plugin._finish_reply_flow("msg-old")
+
+    assert "msg-old" not in plugin._active_reply_flows
+    assert "msg-old" not in plugin._superseded_reply_message_ids
+    assert "msg-old" not in plugin._superseded_reply_flow_times

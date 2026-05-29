@@ -28,6 +28,7 @@
 
 from typing import Optional
 from datetime import datetime
+from astrbot.api import sp
 from astrbot.api.all import *
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
@@ -55,6 +56,86 @@ class MemoryInjector:
     - 强制人格隔离：支持多人格场景，避免人格记忆混淆
     - 实时人格获取：不缓存人格ID，每次调用都重新获取
     """
+
+    @staticmethod
+    async def _get_current_persona_id(
+        context: Context, event: AstrMessageEvent
+    ) -> Optional[str]:
+        """
+        获取当前会话实际生效的人格 ID。
+
+        与 AstrBot 主流程保持一致：先看 /persona 等命令写入的会话配置，
+        再看当前 conversation 绑定，最后回退到全局默认人格。
+        """
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            return None
+
+        try:
+            session_service_config = (
+                await sp.get_async(
+                    scope="umo",
+                    scope_id=str(umo),
+                    key="session_service_config",
+                    default={},
+                )
+                or {}
+            )
+            if isinstance(session_service_config, dict):
+                persona_id = session_service_config.get("persona_id")
+                if persona_id == "[%None]":
+                    return None
+                if persona_id:
+                    return persona_id
+        except Exception as e:
+            if DEBUG_MODE:
+                logger.debug(f"[LivingMemory] 读取会话人格配置失败: {e}")
+
+        conv_mgr = getattr(context, "conversation_manager", None)
+        if conv_mgr:
+            try:
+                curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+                if curr_cid:
+                    conversation = await conv_mgr.get_conversation(umo, curr_cid)
+                    persona_id = (
+                        getattr(conversation, "persona_id", None)
+                        if conversation
+                        else None
+                    )
+                    if persona_id == "[%None]":
+                        return None
+                    if persona_id:
+                        return persona_id
+            except Exception as e:
+                if DEBUG_MODE:
+                    logger.debug(f"[LivingMemory] 读取会话绑定人格失败: {e}")
+
+        persona_mgr = getattr(context, "persona_manager", None)
+        if not persona_mgr:
+            return None
+
+        get_default_persona = getattr(persona_mgr, "get_default_persona_v3", None)
+        if not get_default_persona:
+            return None
+
+        try:
+            try:
+                default_persona = await get_default_persona(umo=umo)
+            except TypeError:
+                default_persona = await get_default_persona(umo)
+
+            if isinstance(default_persona, dict):
+                persona_id = default_persona.get("name")
+            else:
+                persona_id = getattr(default_persona, "name", None)
+
+            if persona_id == "[%None]":
+                return None
+            return persona_id or None
+        except Exception as e:
+            if DEBUG_MODE:
+                logger.debug(f"[LivingMemory] 读取默认人格失败: {e}")
+            return None
 
     @staticmethod
     def _get_livingmemory_plugin_state(context: Context, version: str = "v1"):
@@ -299,15 +380,9 @@ class MemoryInjector:
                 session_id = event.unified_msg_origin
 
                 # 实时获取当前人格ID（支持动态人格切换）
-                try:
-                    persona_id = (
-                        context.persona_manager.get_personas_by_key(session_id).name
-                        if context.persona_manager
-                        else None
-                    )
-                except Exception as pe:
-                    logger.debug(f"[LivingMemory-{version}模式] 获取人格ID失败: {pe}")
-                    persona_id = None
+                persona_id = await MemoryInjector._get_current_persona_id(
+                    context, event
+                )
 
                 # 获取用户消息内容
                 user_message = ""

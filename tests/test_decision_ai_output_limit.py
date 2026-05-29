@@ -108,6 +108,44 @@ def test_should_reply_limits_decision_ai_output_kwargs():
     assert "只能输出一个英文单词：yes 或 no" in provider.last_kwargs["prompt"]
 
 
+def test_call_decision_ai_can_skip_persona_for_internal_classifier():
+    provider = DummyProvider("正常")
+
+    result = asyncio.run(
+        DecisionAI.call_decision_ai(
+            DummyContext(provider),
+            DummyEvent(),
+            "判断频率",
+            use_persona=False,
+            system_prompt_override="内部分类器",
+            max_tokens=4,
+            temperature=0,
+            stop=["\n", "。"],
+        )
+    )
+
+    assert result == "正常"
+    assert provider.last_kwargs["system_prompt"] == "内部分类器"
+    assert provider.last_kwargs["max_tokens"] == 4
+    assert provider.last_kwargs["temperature"] == 0
+    assert provider.last_kwargs["stop"] == ["\n", "。"]
+
+
+def test_call_decision_ai_override_mode_skips_persona_by_default():
+    provider = DummyProvider("正常")
+
+    asyncio.run(
+        DecisionAI.call_decision_ai(
+            DummyContext(provider),
+            DummyEvent(),
+            "判断频率",
+            prompt_mode="override",
+        )
+    )
+
+    assert provider.last_kwargs["system_prompt"] == ""
+
+
 @pytest.mark.parametrize(
     ("completion_text", "expected"),
     [

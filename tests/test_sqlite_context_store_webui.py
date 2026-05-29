@@ -168,6 +168,91 @@ def test_get_messages_by_ids_reads_hot_and_cold(tmp_path):
     run(scenario())
 
 
+def test_flush_persists_dequeued_writer_batch(tmp_path):
+    store = SQLiteContextStore(
+        tmp_path,
+        flush_batch_size=100,
+        flush_interval_seconds=60,
+    )
+
+    async def scenario():
+        await store.start()
+        try:
+            await store.enqueue_message(base_message("queued-1", "queued content"))
+            await asyncio.sleep(0)
+            await store.flush()
+
+            rows = await store.get_recent_messages(
+                platform_id="qq",
+                chat_id="100",
+                limit=10,
+            )
+            assert [row.message_id for row in rows] == ["queued-1"]
+        finally:
+            await store.close()
+
+    run(scenario())
+
+
+def test_concurrent_start_only_creates_one_writer_and_maintenance_task(tmp_path, monkeypatch):
+    store = SQLiteContextStore(tmp_path)
+    real_initialize = store._initialize_sync
+    calls = 0
+
+    def slow_initialize():
+        nonlocal calls
+        calls += 1
+        time.sleep(0.02)
+        real_initialize()
+
+    monkeypatch.setattr(store, "_initialize_sync", slow_initialize)
+
+    async def scenario():
+        await asyncio.gather(*(store.start() for _ in range(6)))
+        try:
+            assert calls == 1
+            worker = store._worker_task
+            maintenance = store._maintenance_task
+            assert worker is not None and not worker.done()
+            assert maintenance is not None and not maintenance.done()
+
+            await asyncio.gather(*(store.start() for _ in range(3)))
+            assert calls == 1
+            assert store._worker_task is worker
+            assert store._maintenance_task is maintenance
+        finally:
+            await store.close()
+
+    run(scenario())
+
+
+def test_close_waits_for_inflight_start_before_stopping(tmp_path, monkeypatch):
+    store = SQLiteContextStore(tmp_path)
+    real_initialize = store._initialize_sync
+    calls = 0
+
+    def slow_initialize():
+        nonlocal calls
+        calls += 1
+        time.sleep(0.02)
+        real_initialize()
+
+    monkeypatch.setattr(store, "_initialize_sync", slow_initialize)
+
+    async def scenario():
+        start_task = asyncio.create_task(store.start())
+        await asyncio.sleep(0)
+        await store.close()
+        await start_task
+
+        assert calls == 1
+        assert store._started is False
+        assert store._worker_task is None
+        assert store._maintenance_task is None
+
+    run(scenario())
+
+
 def test_image_metadata_round_trip_uses_raw_json(tmp_path):
     store = SQLiteContextStore(tmp_path)
 
@@ -238,5 +323,83 @@ def test_update_message_edits_content_and_metadata(tmp_path):
         assert item["edited_at"] > 0
         assert item["edit_reason"] == "unit test"
         await store.close()
+
+    run(scenario())
+
+
+def test_update_by_id_respects_db_scope(tmp_path):
+    store = SQLiteContextStore(tmp_path)
+
+    async def scenario():
+        await store.start()
+        try:
+            hot = base_message("same-id-hot", "hot old")
+            cold = base_message("same-id-cold", "cold old")
+            await store.add_message_sync(hot)
+            cold_row = store._normalize_message(cold)
+            with store._connection(store.cold_db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO messages (
+                        message_id, platform_name, platform_id, chat_id, chat_key,
+                        chat_type, role, sender_id, sender_name, timestamp, content,
+                        reply_to_message_id, image_refs_json, image_descriptions_json,
+                        image_status, trigger_source, probability_filtered,
+                        wait_window_message, raw_json, created_at,
+                        deleted_at, deleted_reason, edited_at, edit_reason
+                    ) VALUES (
+                        :message_id, :platform_name, :platform_id, :chat_id, :chat_key,
+                        :chat_type, :role, :sender_id, :sender_name, :timestamp, :content,
+                        :reply_to_message_id, :image_refs_json, :image_descriptions_json,
+                        :image_status, :trigger_source, :probability_filtered,
+                        :wait_window_message, :raw_json, :created_at,
+                        :deleted_at, :deleted_reason, :edited_at, :edit_reason
+                    )
+                    """,
+                    cold_row,
+                )
+                conn.commit()
+
+            hot_list = await store.list_messages(db_scope="hot")
+            cold_list = await store.list_messages(db_scope="cold")
+            assert hot_list["items"][0]["id"] == cold_list["items"][0]["id"] == 1
+
+            result = await store.update_message_record(
+                {"id": 1},
+                {"content": "hot new"},
+                reason="scope test",
+                db_scope="hot",
+            )
+            assert result["updated_count"] == 1
+
+            hot_after = await store.list_messages(db_scope="hot")
+            cold_after = await store.list_messages(db_scope="cold")
+            assert hot_after["items"][0]["content"] == "hot new"
+            assert cold_after["items"][0]["content"] == "cold old"
+        finally:
+            await store.close()
+
+    run(scenario())
+
+
+def test_invalid_db_scope_is_rejected(tmp_path):
+    store = SQLiteContextStore(tmp_path)
+
+    async def scenario():
+        await store.start()
+        try:
+            await store.add_message_sync(base_message("m3", "old"))
+            try:
+                await store.update_message_record(
+                    {"id": 1},
+                    {"content": "new"},
+                    db_scope="typo",
+                )
+            except ValueError as exc:
+                assert "db_scope" in str(exc)
+            else:
+                raise AssertionError("invalid db_scope should raise")
+        finally:
+            await store.close()
 
     run(scenario())

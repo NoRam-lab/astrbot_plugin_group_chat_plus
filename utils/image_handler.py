@@ -185,6 +185,10 @@ class ImageHandler:
                 sender_id,
                 image_spam_gate,
                 image_to_text_system_prompt,
+                burst_factor=burst_factor,
+                batch_factor=batch_factor,
+                spam_decision=spam_decision,
+                spam_decision_evaluated=True,
             )
 
             if processed_message is None:
@@ -488,6 +492,10 @@ class ImageHandler:
         sender_id: str = "",
         image_spam_gate: Optional[ImageSpamGate] = None,
         image_to_text_system_prompt: str = "",
+        burst_factor: float | None = None,
+        batch_factor: float | None = None,
+        spam_decision: ImageSpamDecision | None = None,
+        spam_decision_evaluated: bool = False,
     ) -> Tuple[Optional[str], List[dict]]:
         try:
             provider = context.get_provider_by_id(provider_id)
@@ -507,27 +515,32 @@ class ImageHandler:
                     image_chain_to_idx[chain_idx] = img_count
                     img_count += 1
 
-            burst_factor = 1.0
-            if image_importance_policy:
-                burst_factor = image_importance_policy.register_image_batch(
-                    chat_key=chat_key,
-                    image_count=len(image_components),
-                    timestamp=time.time(),
+            if burst_factor is None:
+                burst_factor = (
+                    image_importance_policy.register_image_batch(
+                        chat_key=chat_key,
+                        image_count=len(image_components),
+                        timestamp=time.time(),
+                    )
+                    if image_importance_policy
+                    else 1.0
                 )
-            batch_factor = (
-                image_importance_policy.batch_factor(len(image_components))
-                if image_importance_policy
-                else 1.0
-            )
-            spam_decision = ImageHandler._evaluate_spam_gate(
-                image_spam_gate,
-                chat_key=chat_key,
-                sender_id=sender_id,
-                image_count=len(image_components),
-                batch_factor=batch_factor,
-                burst_factor=burst_factor,
-                quoted=any(isinstance(component, Reply) for component in message_chain),
-            )
+            if batch_factor is None:
+                batch_factor = (
+                    image_importance_policy.batch_factor(len(image_components))
+                    if image_importance_policy
+                    else 1.0
+                )
+            if not spam_decision_evaluated:
+                spam_decision = ImageHandler._evaluate_spam_gate(
+                    image_spam_gate,
+                    chat_key=chat_key,
+                    sender_id=sender_id,
+                    image_count=len(image_components),
+                    batch_factor=batch_factor,
+                    burst_factor=burst_factor,
+                    quoted=any(isinstance(component, Reply) for component in message_chain),
+                )
 
             image_descriptions: dict[int, str] = {}
             image_statuses: list[dict] = []

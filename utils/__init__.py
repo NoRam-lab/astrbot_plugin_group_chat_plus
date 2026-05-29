@@ -14,6 +14,7 @@ from .image_spam_gate import ImageSpamGate
 from .context_manager import ContextManager
 from .decision_ai import DecisionAI
 from .reply_handler import ReplyHandler
+from .reply_handler_dkq import ReplyHandlerDKQ
 from .memory_injector import MemoryInjector
 from .tools_reminder import ToolsReminder
 from .keyword_checker import KeywordChecker
@@ -82,6 +83,7 @@ __all__ = [
     "ContextManager",
     "DecisionAI",
     "ReplyHandler",
+    "ReplyHandlerDKQ",
     "MemoryInjector",
     "ToolsReminder",
     "KeywordChecker",

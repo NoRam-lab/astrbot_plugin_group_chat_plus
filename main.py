@@ -115,6 +115,7 @@ from .utils import (
     ContextManager,
     DecisionAI,
     ReplyHandler,
+    ReplyHandlerDKQ,
     MemoryInjector,
     ToolsReminder,
     KeywordChecker,
@@ -165,6 +166,11 @@ class ChatPlus(Star):
     _WAIT_WINDOW_PREFETCH_RESULT_KEY = "gcp_wait_window_prefetch_result"
     _WAIT_WINDOW_PREFETCH_ERROR_KEY = "gcp_wait_window_prefetch_error"
     _WAIT_WINDOW_PREFETCH_FALLBACK_DONE_KEY = "gcp_wait_window_prefetch_fallback_done"
+    _MULTIMODAL_ORIGINAL_IMAGE_HINT = (
+        "\n\n[系统信息-本轮原图]\n"
+        "本轮 LLM 请求附带了当前触发消息及等待窗口追加消息中的原始图片，"
+        "请直接查看原图；文字图片描述仅作为兜底参考。"
+    )
     """
     群聊增强插件主类
 
@@ -228,6 +234,19 @@ class ChatPlus(Star):
         if limit == -1:
             return list(history_messages)
         return list(history_messages[-limit:])
+
+    @staticmethod
+    def _append_unique_image_refs(target: list[str], image_refs: list | None, limit: int) -> None:
+        """Append image refs without duplicates, preserving order and respecting limit."""
+        if limit <= 0 or len(target) >= limit:
+            return
+        for ref in image_refs or []:
+            ref = str(ref or "").strip()
+            if not ref or ref in target:
+                continue
+            target.append(ref)
+            if len(target) >= limit:
+                break
 
     @staticmethod
     def _normalize_positive_int(value, default: int, config_name: str) -> int:
@@ -681,6 +700,28 @@ class ChatPlus(Star):
         self.read_air_blacklist_user_ids = self._normalize_user_id_set(
             config.get("read_air_blacklist_user_ids", [])
         )
+        self.enable_reply_silent_blacklist = bool(
+            config.get("enable_reply_silent_blacklist", False)
+        )
+        self.reply_silent_blacklist_user_ids = self._normalize_user_id_set(
+            config.get("reply_silent_blacklist_user_ids", [])
+        )
+        self.enable_reply_probability_blacklist = bool(
+            config.get("enable_reply_probability_blacklist", False)
+        )
+        self.reply_probability_blacklist_user_ids = self._normalize_user_id_set(
+            config.get("reply_probability_blacklist_user_ids", [])
+        )
+        try:
+            self.reply_probability_blacklist_rate = max(
+                0.0,
+                min(1.0, float(config.get("reply_probability_blacklist_rate", 0.2))),
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "reply_probability_blacklist_rate 配置无效，使用默认值 0.2"
+            )
+            self.reply_probability_blacklist_rate = 0.2
 
         # === 回复AI配置 ===
         self.reply_ai_extra_prompt = config.get(
@@ -925,6 +966,9 @@ class ChatPlus(Star):
         self.enable_image_processing = config.get(
             "enable_image_processing", False
         )  # 启用图片处理
+        self.enable_reply_multimodal_image_mode = bool(
+            config.get("enable_reply_multimodal_image_mode", False)
+        )  # 回复时直传本轮相关原图给 LLM
         self.image_to_text_scope = config.get(
             "image_to_text_scope", "mention_only"
         )  # 图片转文字范围
@@ -1721,6 +1765,12 @@ class ChatPlus(Star):
         # 定期清理超过60秒的旧记录
         self._seen_message_ids = {}
 
+        # 强触发（@机器人/引用回复机器人）会作废同会话中更早的主动回复流。
+        # 这保留同群并行能力，同时避免旧图片/普通消息在用户主动@后又补发第二条。
+        self._active_reply_flows: dict[str, dict] = {}
+        self._superseded_reply_message_ids: set[str] = set()
+        self._superseded_reply_flow_times: dict[str, float] = {}
+
         # ========== v1.0.2 新增功能初始化 ==========
 
         # 1. 情绪追踪系统
@@ -1967,6 +2017,10 @@ class ChatPlus(Star):
                     f"最大并发用户数={self.group_wait_window_max_users})"
             )
             logger.info(f"  - 启用图片处理: {self.enable_image_processing}")
+            logger.info(
+                "  - 回复时直传本轮原图: "
+                f"{self.enable_reply_multimodal_image_mode}"
+            )
             logger.info(f"  - 启用刷图跳过门: {self.enable_image_spam_gate}")
             logger.info(
                 "  - 主动图片理解黑名单用户数: "
@@ -2347,6 +2401,7 @@ class ChatPlus(Star):
                 self.processing_sessions.pop(_cleanup_message_id, None)
                 self.runtime_snapshots.discard(_cleanup_message_id)
                 self._duplicate_blocked_messages.pop(_cleanup_message_id, None)
+                self._finish_reply_flow(_cleanup_message_id)
 
     async def restart_core(self):
         """
@@ -3018,6 +3073,10 @@ class ChatPlus(Star):
                 self.raw_reply_cache.clear()
                 self._pending_bot_replies.clear()
                 self._agent_done_flags.clear()
+                self._ensure_reply_supersede_state()
+                self._active_reply_flows.clear()
+                self._superseded_reply_message_ids.clear()
+                self._superseded_reply_flow_times.clear()
 
                 logger.info(
                     "【插件重置】已清空最近回复缓存 清理会话=%s, 清理条目=%s",
@@ -4292,6 +4351,9 @@ class ChatPlus(Star):
         chat_id: str,
         is_at_message: bool = False,
         has_trigger_keyword: bool = False,
+        is_reply_to_bot: bool = False,
+        poke_info: dict = None,
+        is_welcome_skip_all: bool = False,
         image_urls: list = None,
         history_messages: list = None,
         current_message_cache: dict = None,  # 🔧 修复：当前消息缓存副本，避免并发竞争
@@ -4311,6 +4373,9 @@ class ChatPlus(Star):
             chat_id: 聊天ID
             is_at_message: 是否@消息
             has_trigger_keyword: 是否包含触发关键词
+            is_reply_to_bot: 是否引用回复机器人消息
+            poke_info: 戳一戳信息（如果存在）
+            is_welcome_skip_all: 是否为入群欢迎消息 skip_all 强制处理路径
             image_urls: 图片URL列表（用于多模态AI）
             history_messages: 历史消息列表（AstrBotMessage对象列表，用于contexts）
             current_message_cache: 当前消息的缓存副本（避免并发竞争导致缓存被清空）
@@ -4328,6 +4393,14 @@ class ChatPlus(Star):
         runtime_chat_key = self._get_runtime_chat_key(
             event, platform_name, is_private, chat_id
         )
+        message_id = self._get_message_id(event)
+        if self._is_reply_flow_superseded(message_id):
+            self._discard_reply_runtime_state(event, runtime_chat_key, message_id)
+            logger.info(
+                "[强触发覆盖] 旧回复流在生成前已作废，跳过发送: message_id=%s",
+                message_id,
+            )
+            return
         # 注入记忆
         final_message = formatted_context
         try:
@@ -4421,7 +4494,21 @@ class ChatPlus(Star):
             message_id_for_error = None
 
         try:
-            reply_result = await ReplyHandler.generate_reply(
+            use_dkq_reply_handler = self._should_use_read_air_reply_handler(
+                is_at_message=is_at_message,
+                has_trigger_keyword=has_trigger_keyword,
+                is_reply_to_bot=is_reply_to_bot,
+                poke_info=poke_info,
+                is_welcome_skip_all=is_welcome_skip_all,
+            )
+            reply_handler = ReplyHandlerDKQ if use_dkq_reply_handler else ReplyHandler
+            if self.debug_mode:
+                logger.info(
+                    "【步骤13】回复Handler: %s",
+                    "ReplyHandlerDKQ(读空气)" if use_dkq_reply_handler else "ReplyHandler",
+                )
+
+            reply_result = await reply_handler.generate_reply(
                 event,
                 self.context,
                 final_message,
@@ -4437,6 +4524,14 @@ class ChatPlus(Star):
             ai_error_flag = True
             logger.error(f"生成AI回复时发生未捕获异常: {e}", exc_info=True)
             reply_result = event.plain_result(f"生成回复时发生错误: {str(e)}")
+
+        if self._is_reply_flow_superseded(message_id):
+            self._discard_reply_runtime_state(event, runtime_chat_key, message_id)
+            logger.info(
+                "[强触发覆盖] 旧回复流在AI生成后已作废，跳过发送: message_id=%s",
+                message_id,
+            )
+            return
 
         if (
             not ai_error_flag
@@ -4601,6 +4696,14 @@ class ChatPlus(Star):
             # 阻止框架 ProcessStage 对 @消息触发第二次默认 LLM 调用路径
             if isinstance(reply_result, ProviderRequest):
                 event.call_llm = True
+
+            if self._is_reply_flow_superseded(message_id):
+                self._discard_reply_runtime_state(event, runtime_chat_key, message_id)
+                logger.info(
+                    "[强触发覆盖] 旧回复流在发送前已作废，跳过发送: message_id=%s",
+                    message_id,
+                )
+                return
 
             yield reply_result
 
@@ -5328,6 +5431,251 @@ class ChatPlus(Star):
                     break
         return cleanup_keys
 
+    def _ensure_reply_supersede_state(self) -> None:
+        """Create runtime-only supersede stores for __new__ based tests and hot reloads."""
+        if not hasattr(self, "_active_reply_flows"):
+            self._active_reply_flows = {}
+        if not hasattr(self, "_superseded_reply_message_ids"):
+            self._superseded_reply_message_ids = set()
+        if not hasattr(self, "_superseded_reply_flow_times"):
+            self._superseded_reply_flow_times = {}
+
+    @staticmethod
+    def _should_use_read_air_reply_handler(
+        *,
+        is_at_message: bool = False,
+        has_trigger_keyword: bool = False,
+        is_reply_to_bot: bool = False,
+        poke_info: dict = None,
+        is_welcome_skip_all: bool = False,
+    ) -> bool:
+        """普通读空气回复使用专属 Handler，强触发路径继续走通用 Handler。"""
+        is_poke_bot = False
+        if poke_info and isinstance(poke_info, dict):
+            is_poke_bot = bool(poke_info.get("is_poke_bot"))
+        return (
+            not is_at_message
+            and not has_trigger_keyword
+            and not is_reply_to_bot
+            and not is_poke_bot
+            and not is_welcome_skip_all
+        )
+
+    def _prune_reply_supersede_state(self, now: float | None = None) -> None:
+        self._ensure_reply_supersede_state()
+        now = time.time() if now is None else now
+        cutoff = now - 300
+        for message_id, ts in list(self._superseded_reply_flow_times.items()):
+            if ts < cutoff:
+                self._superseded_reply_flow_times.pop(message_id, None)
+                self._superseded_reply_message_ids.discard(message_id)
+
+    def _register_reply_flow(
+        self,
+        message_id: str,
+        runtime_chat_key: str,
+        *,
+        trigger_kind: str = "normal",
+        sender_id: str = "",
+        stage: str = "registered",
+        buffer_key: str = "",
+    ) -> None:
+        """Track a root message while it may still produce a plugin reply."""
+        if not message_id or not runtime_chat_key:
+            return
+        self._ensure_reply_supersede_state()
+        existing = self._active_reply_flows.get(message_id, {})
+        flow = {
+            **existing,
+            "runtime_chat_key": runtime_chat_key,
+            "trigger_kind": trigger_kind,
+            "sender_id": str(sender_id or existing.get("sender_id") or ""),
+            "stage": stage,
+            "started_at": existing.get("started_at", time.time()),
+            "updated_at": time.time(),
+        }
+        if buffer_key:
+            flow["buffer_key"] = buffer_key
+        self._active_reply_flows[message_id] = flow
+
+    def _update_reply_flow(
+        self,
+        message_id: str,
+        *,
+        stage: str | None = None,
+        buffer_key: str | None = None,
+    ) -> None:
+        self._ensure_reply_supersede_state()
+        flow = self._active_reply_flows.get(message_id)
+        if not flow:
+            return
+        if stage is not None:
+            flow["stage"] = stage
+        if buffer_key is not None and buffer_key:
+            flow["buffer_key"] = buffer_key
+        flow["updated_at"] = time.time()
+
+    def _is_reply_flow_superseded(self, message_id: str) -> bool:
+        self._ensure_reply_supersede_state()
+        return bool(message_id and message_id in self._superseded_reply_message_ids)
+
+    def _finish_reply_flow(self, message_id: str) -> None:
+        self._ensure_reply_supersede_state()
+        if not message_id:
+            return
+        self._active_reply_flows.pop(message_id, None)
+        self._superseded_reply_message_ids.discard(message_id)
+        self._superseded_reply_flow_times.pop(message_id, None)
+
+    def _discard_reply_runtime_state(
+        self,
+        event: AstrMessageEvent | None,
+        runtime_chat_key: str,
+        message_id: str,
+    ) -> None:
+        """Drop runtime send/save state for a reply flow that must not emit output."""
+        try:
+            if event is not None and getattr(event, "is_at_or_wake_command", False):
+                event.call_llm = True
+        except Exception:
+            pass
+
+        for attr, method_name in (
+            ("runtime_snapshots", "discard"),
+            ("_agent_done_flags", "discard"),
+        ):
+            store = getattr(self, attr, None)
+            method = getattr(store, method_name, None)
+            if method:
+                try:
+                    method(message_id)
+                except Exception:
+                    pass
+
+        for attr in (
+            "raw_reply_cache",
+            "_pending_bot_replies",
+            "_duplicate_blocked_messages",
+            "_ai_error_message_ids",
+        ):
+            store = getattr(self, attr, None)
+            try:
+                if hasattr(store, "discard"):
+                    store.discard(message_id)
+                elif hasattr(store, "pop"):
+                    store.pop(message_id, None)
+            except Exception:
+                pass
+
+        flow = getattr(self, "_active_reply_flows", {}).get(message_id, {})
+        buffer_key = ""
+        try:
+            buffer_key = self._get_wait_window_buffer_key(event, runtime_chat_key) if event else ""
+        except Exception:
+            buffer_key = ""
+        buffer_key = buffer_key or flow.get("buffer_key") or ""
+        if buffer_key:
+            try:
+                self.wait_window_buffer.clear(buffer_key)
+            except Exception:
+                pass
+
+    async def _abort_superseded_reply_flow(
+        self,
+        event: AstrMessageEvent,
+        runtime_chat_key: str,
+        message_id: str,
+        *,
+        stage: str,
+        message_trace: dict[str, Any] | None = None,
+        memory_prefetch_task=None,
+        record_user_message: bool = False,
+    ) -> None:
+        """Stop this plugin's reply path after a newer strong trigger superseded it."""
+        if record_user_message:
+            try:
+                await self._record_filtered_user_message(
+                    event, source=f"superseded_{stage}"
+                )
+            except Exception:
+                logger.warning("[强触发覆盖] 作废旧流时记录用户消息失败", exc_info=True)
+        if memory_prefetch_task is not None:
+            self._cancel_background_task(memory_prefetch_task, f"强触发覆盖/{stage}")
+        self._discard_reply_runtime_state(event, runtime_chat_key, message_id)
+        self._finish_reply_flow(message_id)
+        logger.info(
+            "[强触发覆盖] 已停止旧回复流: message_id=%s, runtime_key=%s, stage=%s",
+            message_id,
+            runtime_chat_key,
+            stage,
+        )
+        self._trace_summary(message_trace, status=f"superseded_{stage}")
+
+    async def _supersede_prior_reply_flows(
+        self,
+        runtime_chat_key: str,
+        current_message_id: str,
+        *,
+        reason: str,
+    ) -> list[str]:
+        """Mark older in-flight flows in the same chat so they cannot send later."""
+        self._ensure_reply_supersede_state()
+        self._prune_reply_supersede_state()
+        current_flow = self._active_reply_flows.get(current_message_id, {})
+        current_started_at = float(current_flow.get("started_at") or time.time())
+        victims = [
+            message_id
+            for message_id, flow in list(self._active_reply_flows.items())
+            if message_id != current_message_id
+            and flow.get("runtime_chat_key") == runtime_chat_key
+            and flow.get("trigger_kind") not in ("at", "reply")
+            and float(flow.get("started_at") or 0.0) <= current_started_at
+        ]
+        if not victims:
+            return []
+
+        now = time.time()
+        victim_set = set(victims)
+        victim_buffers = set()
+        for message_id in victims:
+            flow = self._active_reply_flows.get(message_id, {})
+            flow["superseded_by"] = current_message_id
+            flow["superseded_reason"] = reason
+            flow["superseded_at"] = now
+            self._superseded_reply_message_ids.add(message_id)
+            self._superseded_reply_flow_times[message_id] = now
+            buffer_key = flow.get("buffer_key")
+            if buffer_key:
+                victim_buffers.add(buffer_key)
+                try:
+                    self.wait_window_buffer.clear(buffer_key)
+                except Exception:
+                    pass
+
+        try:
+            async with self._group_wait_window_lock:
+                for window_key, window in list(self._group_wait_windows.items()):
+                    key_runtime, key_scope = window_key
+                    if key_runtime != runtime_chat_key:
+                        continue
+                    buffer_key = window.get("buffer_key") or ""
+                    if (
+                        key_scope in {f"message:{mid}" for mid in victim_set}
+                        or buffer_key in victim_buffers
+                    ):
+                        window["force_complete"] = True
+        except Exception:
+            logger.warning("[强触发覆盖] 结束旧等待窗口失败", exc_info=True)
+
+        logger.info(
+            "[强触发覆盖] %s 触发，作废同会话旧回复流: current=%s, victims=%s, runtime_key=%s",
+            reason,
+            current_message_id,
+            ",".join(victims),
+            runtime_chat_key,
+        )
+        return victims
+
     def _get_processing_conflicts(
         self, runtime_chat_key: str, message_id: str
     ) -> list[str]:
@@ -5595,6 +5943,8 @@ class ChatPlus(Star):
                     "image_refs": image_meta.get("image_refs") or [],
                     "image_descriptions": image_meta.get("image_descriptions") or [],
                     "image_status": image_meta.get("image_status") or "",
+                    "image_items": image_meta.get("image_items") or [],
+                    "image_policy_version": image_meta.get("policy_version") or "",
                     "reply_to_message_id": reply_message_ids[0]
                     if reply_message_ids
                     else "",
@@ -6305,6 +6655,55 @@ class ChatPlus(Star):
             "policy_version": "image_importance_gate_v1",
         }
 
+    def _collect_reply_multimodal_image_urls(
+        self,
+        current_message_cache: dict | None,
+        window_buffered_messages: list | None = None,
+    ) -> list[str]:
+        """Collect original images for this reply only: current message plus wait window."""
+        if not getattr(self, "enable_reply_multimodal_image_mode", False):
+            return []
+        try:
+            limit = max(1, int(getattr(self, "max_images_per_message", 10) or 10))
+        except Exception:
+            limit = 10
+
+        image_urls: list[str] = []
+        if isinstance(current_message_cache, dict):
+            self._append_unique_image_refs(
+                image_urls,
+                current_message_cache.get("image_urls")
+                or current_message_cache.get("image_refs"),
+                limit,
+            )
+
+        if window_buffered_messages:
+            sorted_window_messages = sorted(
+                [m for m in window_buffered_messages if isinstance(m, dict)],
+                key=lambda m: (m.get("message_timestamp") or m.get("timestamp", 0)),
+            )
+            for message in sorted_window_messages:
+                self._append_unique_image_refs(
+                    image_urls,
+                    message.get("image_urls") or message.get("image_refs"),
+                    limit,
+                )
+                if len(image_urls) >= limit:
+                    break
+
+        return image_urls
+
+    def _append_multimodal_original_image_hint(
+        self, prompt_text: str, image_urls: list | None
+    ) -> str:
+        if not image_urls:
+            return prompt_text
+        hint = self._MULTIMODAL_ORIGINAL_IMAGE_HINT
+        text = prompt_text or ""
+        if hint.strip() in text:
+            return text
+        return text + hint
+
     async def _process_images_for_context_cache(
         self,
         event: AstrMessageEvent,
@@ -6408,18 +6807,16 @@ class ChatPlus(Star):
                 )
                 if self.enable_image_importance_gate_log or self.debug_mode:
                     logger.info(
-                        "[GCP图片状态] message_id=%s idx=%s status=%s keep=%s model=%.3f effective=%.3f time=%.2f burst=%.2f batch=%.2f threshold=%.3f reason=%s",
-                        message_id,
-                        idx,
-                        status,
-                        bool(item.get("keep", True)),
-                        float(item.get("importance") or 0.0),
-                        float(item.get("effective_importance") or 0.0),
-                        float(item.get("time_factor") or 1.0),
-                        float(item.get("burst_factor") or 1.0),
-                        float(item.get("batch_factor") or 1.0),
-                        float(item.get("threshold") or 0.0),
-                        str(item.get("gate_reason") or item.get("failure_reason") or "")[:80],
+                        "[GCP图片状态] "
+                        f"message_id={message_id} idx={idx} status={status} "
+                        f"keep={bool(item.get('keep', True))} "
+                        f"model={float(item.get('importance') or 0.0):.3f} "
+                        f"effective={float(item.get('effective_importance') or 0.0):.3f} "
+                        f"time={float(item.get('time_factor') or 1.0):.2f} "
+                        f"burst={float(item.get('burst_factor') or 1.0):.2f} "
+                        f"batch={float(item.get('batch_factor') or 1.0):.2f} "
+                        f"threshold={float(item.get('threshold') or 0.0):.3f} "
+                        f"reason={str(item.get('gate_reason') or item.get('failure_reason') or '')[:80]}"
                     )
         except Exception as e:
             logger.warning("[GCP图片状态] 写入失败: %s", e, exc_info=True)
@@ -6614,6 +7011,7 @@ class ChatPlus(Star):
         runtime_chat_key = self._get_runtime_chat_key(
             event, platform_name, is_private, chat_id
         )
+        message_id = self._get_message_id(event)
         message_trace = self._build_message_trace(event, str(chat_id))
         self._set_message_trace(event, message_trace)
         self._trace_step(
@@ -6641,6 +7039,18 @@ class ChatPlus(Star):
         ) = await self._check_message_triggers(event)
 
         is_reply_to_bot = self._is_reply_to_bot_message(event)
+        strong_trigger_kind = ""
+        if is_at_message:
+            strong_trigger_kind = "at"
+        elif is_reply_to_bot:
+            strong_trigger_kind = "reply"
+        self._register_reply_flow(
+            message_id,
+            runtime_chat_key,
+            trigger_kind=strong_trigger_kind or "normal",
+            sender_id=event.get_sender_id(),
+            stage="trigger_check",
+        )
         self._trace_step(
             message_trace,
             "trigger_check",
@@ -6650,6 +7060,12 @@ class ChatPlus(Star):
                 f"reply={is_reply_to_bot}"
             ),
         )
+        if strong_trigger_kind:
+            await self._supersede_prior_reply_flows(
+                runtime_chat_key,
+                message_id,
+                reason=strong_trigger_kind,
+            )
         if is_reply_to_bot and self.debug_mode:
             logger.info("【步骤2.1】检测到引用回复机器人消息")
 
@@ -6667,7 +7083,16 @@ class ChatPlus(Star):
             if hasattr(event, "get_extra")
             else False
         )
-        if self._should_apply_read_air_blacklist(
+        reply_silent_blacklisted = self._is_reply_silent_blacklisted(event)
+        if reply_silent_blacklisted:
+            self._trace_step(
+                message_trace,
+                "reply_silent_blacklist",
+                time.perf_counter(),
+                detail="record_only=true",
+            )
+
+        if not reply_silent_blacklisted and self._should_apply_read_air_blacklist(
             event,
             is_at_message=is_at_message,
             has_trigger_keyword=has_trigger_keyword,
@@ -6695,9 +7120,14 @@ class ChatPlus(Star):
         # - 戳一戳：不被拦截，正常走后续流程
         # - 普通消息：被拦截缓存
         _trace_stage_start = time.perf_counter()
-        _gww_absorb_messages = self._should_absorb_wait_window_messages()
+        _gww_absorb_messages = (
+            False
+            if reply_silent_blacklisted
+            else self._should_absorb_wait_window_messages()
+        )
         if (
-            self.enable_group_wait_window
+            not reply_silent_blacklisted
+            and self.enable_group_wait_window
             and self._group_wait_window_max_extra > 0
             and _gww_absorb_messages
         ):
@@ -6719,7 +7149,11 @@ class ChatPlus(Star):
             if _gww_intercepted:
                 self._trace_summary(message_trace, status="wait_window_intercepted")
                 return
-        elif self.enable_group_wait_window and self._group_wait_window_max_extra > 0:
+        elif (
+            not reply_silent_blacklisted
+            and self.enable_group_wait_window
+            and self._group_wait_window_max_extra > 0
+        ):
             self._trace_step(
                 message_trace,
                 "wait_window_intercept_check",
@@ -6776,17 +7210,20 @@ class ChatPlus(Star):
             detail=f"is_emoji={is_emoji_message}",
         )
         _trace_stage_start = time.perf_counter()
-        should_process = await self._check_probability_before_processing(
-            event,
-            platform_name,
-            is_private,
-            chat_id,
-            is_at_message,
-            has_trigger_keyword,
-            is_reply_to_bot,
-            poke_info_for_probability,  # 传递戳一戳信息
-            is_emoji_message=is_emoji_message,  # 🆕 v1.2.0: 传递表情包检测结果
-        )
+        if reply_silent_blacklisted:
+            should_process = True
+        else:
+            should_process = await self._check_probability_before_processing(
+                event,
+                platform_name,
+                is_private,
+                chat_id,
+                is_at_message,
+                has_trigger_keyword,
+                is_reply_to_bot,
+                poke_info_for_probability,  # 传递戳一戳信息
+                is_emoji_message=is_emoji_message,  # 🆕 v1.2.0: 传递表情包检测结果
+            )
         self._trace_step(
             message_trace,
             "probability_check",
@@ -6922,6 +7359,7 @@ class ChatPlus(Star):
                 logger.warning(f"[概率过滤-落库] 保存消息失败: {e}")
 
             # 概率判断失败，返回（不继续处理）
+            self._finish_reply_flow(message_id)
             return
 
         # 🆕 v1.2.0: 群聊等待窗口激活
@@ -6930,6 +7368,8 @@ class ChatPlus(Star):
         _gww_extra_count = 0  # 🔧 等待窗口收集的额外消息数（用于注意力机制补偿）
         memory_prefetch_task = None  # 等待窗口期间启动的记忆预召回任务
         if (
+            not reply_silent_blacklisted
+            and
             self.enable_group_wait_window
             and poke_info_for_probability is None
             and self._group_wait_window_max_extra > 0
@@ -6975,6 +7415,9 @@ class ChatPlus(Star):
             if message_trace is not None:
                 message_trace["window_token"] = _gww_token
                 message_trace["window_buffer_key"] = _gww_buffer_key
+            self._update_reply_flow(
+                message_id, stage="wait_window", buffer_key=_gww_buffer_key
+            )
             _trace_stage_start = time.perf_counter()
             self._trace_step(
                 message_trace,
@@ -6997,6 +7440,18 @@ class ChatPlus(Star):
                 detail=f"extra_count={_gww_extra_count}",
             )
 
+        if self._is_reply_flow_superseded(message_id):
+            await self._abort_superseded_reply_flow(
+                event,
+                runtime_chat_key,
+                message_id,
+                stage="wait_window",
+                message_trace=message_trace,
+                memory_prefetch_task=memory_prefetch_task,
+                record_user_message=True,
+            )
+            return
+
         # 步骤3.5: 检测@提及信息（在图片处理之前，避免不必要的开销）
         mention_info = await self._check_mention_others(event)
 
@@ -7010,7 +7465,11 @@ class ChatPlus(Star):
 
         # 收到戳一戳后的反戳逻辑（放在概率判断之后）：
         # 若命中概率，则反戳并丢弃本插件处理中剩余步骤
-        if poke_info:
+        if (
+            poke_info
+            and not reply_silent_blacklisted
+            and not self._is_reply_probability_blacklisted(event)
+        ):
             reversed_and_discarded = await self._maybe_reverse_poke_on_poke(
                 event, poke_info, is_private, chat_id
             )
@@ -7021,7 +7480,7 @@ class ChatPlus(Star):
 
         # 🆕 @消息提前检查是否已被其他插件处理，避免后续耗时操作（如图片转文字）
         # 注意：只检查真正的@消息，不检查触发关键词消息
-        if is_at_message:
+        if is_at_message and not reply_silent_blacklisted:
             if ReplyHandler.check_if_already_replied(event):
                 logger.info("@消息已被其他插件处理,跳过后续流程")
                 if self.debug_mode:
@@ -7033,6 +7492,7 @@ class ChatPlus(Star):
         # 步骤4-6: 处理消息内容（图片处理等耗时操作）
         # 使用 should_treat_as_at 作为 is_at_message 参与后续元数据/触发方式处理，
         # 同时通过 raw_is_at_message 传入真实的 @ 状态，便于图片识别范围精细控制
+        self._update_reply_flow(message_id, stage="context_build")
         _trace_stage_start = time.perf_counter()
         result = await self._process_message_content(
             event,
@@ -7069,6 +7529,30 @@ class ChatPlus(Star):
             emoji_marker_applied,  # 🆕 v1.2.0: 表情包标记是否已添加
         ) = result
 
+        if self._is_reply_flow_superseded(message_id):
+            if cached_message_data:
+                _trace_stage_start = time.perf_counter()
+                saved = await ContextManager.save_cached_user_message(
+                    event,
+                    cached_message_data,
+                    source="superseded_context_build",
+                )
+                self._trace_step(
+                    message_trace,
+                    "save_current_message",
+                    _trace_stage_start,
+                    detail=f"saved={saved} superseded=true",
+                )
+            await self._abort_superseded_reply_flow(
+                event,
+                runtime_chat_key,
+                message_id,
+                stage="context_build",
+                message_trace=message_trace,
+                memory_prefetch_task=memory_prefetch_task,
+            )
+            return
+
         current_message_saved = False
         if cached_message_data:
             _trace_stage_start = time.perf_counter()
@@ -7082,7 +7566,31 @@ class ChatPlus(Star):
                 detail=f"saved={current_message_saved}",
             )
 
-        merged_image_urls = image_urls or []
+        window_buffer_key = self._get_wait_window_buffer_key(event, runtime_chat_key)
+        window_buffered_messages = (
+            self.wait_window_buffer.get(window_buffer_key) if window_buffer_key else []
+        )
+        merged_image_urls = self._collect_reply_multimodal_image_urls(
+            cached_message_data,
+            window_buffered_messages,
+        )
+        if self.debug_mode and merged_image_urls:
+            logger.info(
+                "[多模态原图] 本轮将传递 %d 张原图给 LLM（当前消息+等待窗口，已按上限截断）",
+                len(merged_image_urls),
+            )
+
+        if reply_silent_blacklisted:
+            self._cancel_background_task(memory_prefetch_task, "reply silent blacklist")
+            self._trace_summary(message_trace, status="reply_silent_blacklisted")
+            return
+
+        if self._should_block_reply_by_probability_blacklist(event):
+            self._cancel_background_task(
+                memory_prefetch_task, "reply probability blacklist"
+            )
+            self._trace_summary(message_trace, status="reply_probability_blacklisted")
+            return
 
         # 在AI决策判断之前保存当前消息快照，供发送后钩子和兜底逻辑使用。
         current_message_cache = cached_message_data
@@ -7121,7 +7629,10 @@ class ChatPlus(Star):
             # 🆕 v1.2.0: 传递原始消息文本用于关键词检测
             should_reply = await self._check_ai_decision(
                 event,
-                decision_formatted_context,
+                self._append_multimodal_original_image_hint(
+                    decision_formatted_context,
+                    merged_image_urls,
+                ),
                 is_at_message,
                 has_trigger_keyword,
                 is_reply_to_bot,
@@ -7158,7 +7669,16 @@ class ChatPlus(Star):
             return
 
         # 🔧 修复：使用message_id作为键，避免同一会话中多条消息并发时标记冲突
-        message_id = self._get_message_id(event)
+        if self._is_reply_flow_superseded(message_id):
+            await self._abort_superseded_reply_flow(
+                event,
+                runtime_chat_key,
+                message_id,
+                stage="ai_decision",
+                message_trace=message_trace,
+                memory_prefetch_task=memory_prefetch_task,
+            )
+            return
 
         # 🔧 并发保护：使用锁保护检查-标记流程，避免竞态条件
         # 并行模式下同会话根消息不互相等待；关闭并行时恢复同会话串行等待。
@@ -7187,6 +7707,7 @@ class ChatPlus(Star):
                 if not blocking_processing:
                     # 没有需要阻塞的同会话消息，立即标记并退出
                     self.processing_sessions[message_id] = runtime_chat_key
+                    self._update_reply_flow(message_id, stage="processing")
                     if (
                         existing_processing
                         and getattr(self, "enable_same_chat_parallel_reply", True)
@@ -7230,6 +7751,7 @@ class ChatPlus(Star):
                     )
                 # 即使有竞争也要标记，否则这条消息无法被清理
                 self.processing_sessions[message_id] = runtime_chat_key
+                self._update_reply_flow(message_id, stage="processing")
                 if self.debug_mode:
                     logger.info(f"  已标记消息 {message_id[:30]}... 为本插件处理中")
 
@@ -7343,7 +7865,7 @@ class ChatPlus(Star):
             # 检查是否真的需要添加标记：
             # 1. 如果有图片 URL（多模态路径），说明图片信息保留
             # 2. 如果 message_text 中包含图片描述标记（图片转文字路径），说明图片信息保留
-            has_image_info = bool(merged_image_urls) or (
+            has_image_info = bool(image_urls) or bool(merged_image_urls) or (
                 "[图片内容:" in message_text if message_text else False
             )
 
@@ -7383,16 +7905,35 @@ class ChatPlus(Star):
             elif not has_image_info and self.debug_mode:
                 logger.info("【回退路径】🎭 表情包图片信息已被过滤，跳过添加标记")
 
+        if self._is_reply_flow_superseded(message_id):
+            await self._abort_superseded_reply_flow(
+                event,
+                runtime_chat_key,
+                message_id,
+                stage="before_reply",
+                message_trace=message_trace,
+                memory_prefetch_task=memory_prefetch_task,
+            )
+            return
+
+        self._update_reply_flow(message_id, stage="reply_generate")
         _trace_stage_start = time.perf_counter()
+        reply_formatted_context = self._append_multimodal_original_image_hint(
+            formatted_context,
+            merged_image_urls,
+        )
         async for result in self._generate_and_send_reply(
             event,
-            formatted_context,
+            reply_formatted_context,
             message_text,
             platform_name,
             is_private,
             chat_id,
             is_at_message,
             has_trigger_keyword,  # 🆕 v1.0.4: 传递触发方式信息
+            is_reply_to_bot,
+            poke_info,
+            _welcome_skip_all,
             merged_image_urls,  # 传递图片URL列表（用于多模态AI）
             history_messages,  # 🔧 修复：传递历史消息用于构建contexts
             current_message_cache,  # 当前消息运行期快照
@@ -7761,6 +8302,16 @@ class ChatPlus(Star):
             # 🔧 修复：使用message_id作为键进行检查
             message_id = self._get_message_id(event)
 
+            if self._is_reply_flow_superseded(message_id):
+                event.clear_result()
+                self._discard_reply_runtime_state(event, runtime_chat_key, message_id)
+                self._finish_reply_flow(message_id)
+                logger.info(
+                    "[强触发覆盖] 装饰阶段清空已作废旧回复: message_id=%s",
+                    message_id,
+                )
+                return
+
             # 仅处理由本插件触发的消息
             if message_id not in self.processing_sessions:
                 return
@@ -7959,6 +8510,18 @@ class ChatPlus(Star):
 
             # 🔧 修复：使用message_id作为键进行检查
             message_id = self._get_message_id(event)
+
+            if self._is_reply_flow_superseded(message_id):
+                async with self.concurrent_lock:
+                    self.processing_sessions.pop(message_id, None)
+                    self._agent_done_flags.discard(message_id)
+                self._discard_reply_runtime_state(event, runtime_chat_key, message_id)
+                self._finish_reply_flow(message_id)
+                logger.info(
+                    "[强触发覆盖] 跳过已作废旧回复保存: message_id=%s",
+                    message_id,
+                )
+                return
 
             # 🔒 使用锁保护检查和删除操作，避免与并发检测冲突
             async with self.concurrent_lock:
@@ -8228,6 +8791,8 @@ class ChatPlus(Star):
                 logger.warning(f"[消息发送后] ⚠️ 保存到GCP SQLite失败")
                 if self.debug_mode:
                     logger.info(f"[消息发送后] 保存失败，用户消息仍已在进入AI前落库")
+
+            self._finish_reply_flow(message_id)
 
             if hasattr(self, "_ai_error_message_ids"):
                 try:
@@ -8553,6 +9118,7 @@ class ChatPlus(Star):
                 self.processing_sessions.pop(message_id, None)
                 self._agent_done_flags.discard(message_id)
             self.runtime_snapshots.discard(message_id)
+            self._finish_reply_flow(message_id)
             cleared_buffer_key, cleared_wait_count = (
                 self._clear_wait_window_buffer_for_event(event, runtime_chat_key)
             )
@@ -8801,23 +9367,55 @@ class ChatPlus(Star):
                     result_id = f"{platform_name}_{platform_msg_id}"
 
             if not result_id:
-                # 回退方案：使用确定性内容哈希（不含随机/时间因子）
-                # 🔧 修复：去掉 time_ns()，确保同一消息被平台重复推送时生成相同ID
-                # 这样 _seen_message_ids 的去重才能正确工作
+                # 回退方案：尽量从消息对象和原始链路提取稳定特征。
+                # 不再只用秒级时间+前100字符，避免同秒相同文本的真实消息互相吞掉。
+                platform_name = str(event.get_platform_name() or "")
+                try:
+                    platform_id = str(event.get_platform_id() or "")
+                except Exception:
+                    platform_id = ""
                 sender_id = event.get_sender_id()
                 group_id = (
                     event.get_group_id() if not event.is_private_chat() else "private"
                 )
-                msg_content = event.get_message_str()[:100]  # 只取前100字符避免过长
-
-                # 🔧 使用秒级时间戳（取整到秒），允许同一秒内的重复推送被识别为同一消息
-                # 同时不同秒的相同内容消息仍然有不同的ID
-                timestamp_sec = int(time.time())
-                hash_input = (
-                    f"{sender_id}_{group_id}_{msg_content}_{timestamp_sec}".encode(
-                        "utf-8"
+                message_obj = getattr(event, "message_obj", None)
+                raw_message = getattr(message_obj, "raw_message", None)
+                raw_ids = []
+                if isinstance(raw_message, dict):
+                    for key in ("message_id", "id", "seq", "message_seq", "real_id"):
+                        value = raw_message.get(key)
+                        if value not in (None, ""):
+                            raw_ids.append(f"{key}={value}")
+                timestamp = getattr(message_obj, "timestamp", None)
+                message_chain = getattr(message_obj, "message", None)
+                if message_chain:
+                    chain_repr = repr(
+                        [
+                            (
+                                type(component).__name__,
+                                getattr(component, "text", None),
+                                getattr(component, "url", None),
+                                getattr(component, "file", None),
+                                getattr(component, "id", None),
+                            )
+                            for component in message_chain
+                        ]
                     )
-                )
+                else:
+                    chain_repr = ""
+                msg_content = event.get_message_str()
+                hash_input = "|".join(
+                    [
+                        platform_name,
+                        platform_id,
+                        str(sender_id),
+                        str(group_id),
+                        str(timestamp or ""),
+                        ",".join(raw_ids),
+                        chain_repr,
+                        msg_content,
+                    ]
+                ).encode("utf-8", errors="ignore")
                 content_hash = hashlib.md5(hash_input).hexdigest()[:16]  # 取前16位即可
                 result_id = f"{sender_id}_{group_id}_{content_hash}"
 
@@ -9060,6 +9658,54 @@ class ChatPlus(Star):
             return str(event.get_sender_id()).strip() in blacklist
         except Exception:
             return False
+
+    def _is_reply_silent_blacklisted(self, event: AstrMessageEvent) -> bool:
+        if not getattr(self, "enable_reply_silent_blacklist", False):
+            return False
+        blacklist = getattr(self, "reply_silent_blacklist_user_ids", set())
+        if not blacklist:
+            return False
+        try:
+            return str(event.get_sender_id()).strip() in blacklist
+        except Exception:
+            return False
+
+    def _is_reply_probability_blacklisted(self, event: AstrMessageEvent) -> bool:
+        if not getattr(self, "enable_reply_probability_blacklist", False):
+            return False
+        blacklist = getattr(self, "reply_probability_blacklist_user_ids", set())
+        if not blacklist:
+            return False
+        try:
+            return str(event.get_sender_id()).strip() in blacklist
+        except Exception:
+            return False
+
+    def _should_block_reply_by_probability_blacklist(
+        self, event: AstrMessageEvent
+    ) -> bool:
+        if not self._is_reply_probability_blacklisted(event):
+            return False
+        try:
+            allow_rate = float(getattr(self, "reply_probability_blacklist_rate", 0.2))
+        except (TypeError, ValueError):
+            allow_rate = 0.2
+        allow_rate = max(0.0, min(1.0, allow_rate))
+        if allow_rate <= 0:
+            return True
+        if allow_rate >= 1:
+            return False
+        roll = random.random()
+        blocked = roll >= allow_rate
+        if getattr(self, "debug_mode", False):
+            logger.info(
+                "[reply_probability_blacklist] sender=%s rate=%.3f roll=%.3f blocked=%s",
+                event.get_sender_id(),
+                allow_rate,
+                roll,
+                blocked,
+            )
+        return blocked
 
     def _should_apply_read_air_blacklist(
         self,

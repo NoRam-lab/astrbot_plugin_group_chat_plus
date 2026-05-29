@@ -101,6 +101,7 @@ class PluginPageApi:
 
         payload = await request.get_json(silent=True) or {}
         selector = self._extract_selector(payload)
+        db_scope = self._extract_db_scope(payload, default="all")
         updates: dict[str, Any] = {}
         for field in ("content", "sender_name", "image_status", "image_descriptions"):
             if field in payload:
@@ -113,7 +114,7 @@ class PluginPageApi:
                 selector,
                 updates,
                 reason=str(payload.get("reason", "")).strip(),
-                db_scope=str(payload.get("db", "all")).strip().lower() or "all",
+                db_scope=db_scope,
             )
             return self._ok(result)
         except Exception as exc:
@@ -141,7 +142,7 @@ class PluginPageApi:
         try:
             result = await store.restore_messages(
                 [self._extract_selector(payload)],
-                db_scope=str(payload.get("db", "all")).strip().lower() or "all",
+                db_scope=self._extract_db_scope(payload, default="all"),
             )
             return self._ok(result)
         except Exception as exc:
@@ -170,7 +171,7 @@ class PluginPageApi:
             result = await store.soft_delete_messages(
                 selectors,
                 reason=str(payload.get("reason", "")).strip(),
-                db_scope=str(payload.get("db", "all")).strip().lower() or "all",
+                db_scope=self._extract_db_scope(payload, default="all"),
             )
             return self._ok(result)
         except Exception as exc:
@@ -200,6 +201,19 @@ class PluginPageApi:
             if value not in (None, ""):
                 selected[field] = value
         return selected
+
+    @staticmethod
+    def _extract_db_scope(payload: dict[str, Any], *, default: str = "hot") -> str:
+        raw: Any = None
+        if isinstance(payload, dict):
+            raw = payload.get("db")
+            selector = payload.get("selector")
+            if raw in (None, "") and isinstance(selector, dict):
+                raw = selector.get("db")
+        scope = str(raw or default or "hot").strip().lower()
+        if scope not in {"hot", "cold", "all"}:
+            raise ValueError("db 必须是 hot、cold 或 all")
+        return scope
 
     @staticmethod
     def _parse_bool(value: Any) -> bool:

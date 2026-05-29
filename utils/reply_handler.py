@@ -135,8 +135,25 @@ class ReplyHandler:
     # 系统回复提示词的结束指令（单独分离，用于插入自定义提示词）
     SYSTEM_REPLY_PROMPT_ENDING = "\n请开始回复：\n"
 
-    @staticmethod
+    @classmethod
+    def _build_sender_emphasis(
+        cls, sender_id: str, sender_name: str, include_sender_info: bool
+    ) -> str:
+        if not include_sender_info:
+            return ""
+        if sender_name:
+            return (
+                f"\n\n[系统信息-当前对话对象] {sender_name}（ID:{sender_id}）\n"
+                f"注意：历史中有多个用户发言，只回复 {sender_name} 的当前消息，不要叫错人。\n"
+            )
+        return (
+            f"\n\n[系统信息-当前对话对象] 用户ID:{sender_id}\n"
+            f"注意：历史中有多个用户发言，只回复该用户的当前消息。\n"
+        )
+
+    @classmethod
     async def generate_reply(
+        cls,
         event: AstrMessageEvent,
         context: Context,
         formatted_message: str,
@@ -183,20 +200,11 @@ class ReplyHandler:
 
         try:
             # 🆕 提取当前发送者信息，用于强化识别（仅在开启 include_sender_info 时添加）
-            sender_emphasis = ""
             sender_id = event.get_sender_id()
             sender_name = event.get_sender_name()
-            if include_sender_info:
-                if sender_name:
-                    sender_emphasis = (
-                        f"\n\n[系统信息-当前对话对象] {sender_name}（ID:{sender_id}）\n"
-                        f"注意：历史中有多个用户发言，只回复 {sender_name} 的当前消息，不要叫错人。\n"
-                    )
-                else:
-                    sender_emphasis = (
-                        f"\n\n[系统信息-当前对话对象] 用户ID:{sender_id}\n"
-                        f"注意：历史中有多个用户发言，只回复该用户的当前消息。\n"
-                    )
+            sender_emphasis = cls._build_sender_emphasis(
+                sender_id, sender_name, include_sender_info
+            )
 
             # 🆕 v1.2.0: 构建对话疲劳收尾提示（当启用疲劳机制且需要收尾时）
             fatigue_closing_prompt = ""
@@ -243,7 +251,7 @@ class ReplyHandler:
                     )
             else:
                 # 拼接模式（默认）：系统提示词（静态）在前，动态内容在后
-                full_prompt = ReplyHandler.SYSTEM_REPLY_PROMPT
+                full_prompt = cls.SYSTEM_REPLY_PROMPT
 
                 # 如果有用户自定义提示词,紧跟在系统提示词后面（也是相对静态的）
                 if extra_prompt and extra_prompt.strip():
@@ -254,7 +262,7 @@ class ReplyHandler:
                         )
 
                 # 添加结束指令（静态）
-                full_prompt += ReplyHandler.SYSTEM_REPLY_PROMPT_ENDING
+                full_prompt += cls.SYSTEM_REPLY_PROMPT_ENDING
 
                 # 动态内容放在最后
                 # 🔧 v1.3.0: sender_emphasis 提前到 formatted_message 之前

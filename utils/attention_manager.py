@@ -198,9 +198,6 @@ class AttentionManager:
 
         """
 
-        if AttentionManager._initialized:
-            return
-
         if not data_dir:
             # 如果未提供data_dir，禁用持久化功能
 
@@ -208,6 +205,13 @@ class AttentionManager:
                 "[注意力机制] 未提供data_dir参数，持久化功能将被禁用。"
                 "请确保通过 StarTools.get_data_dir() 获取数据目录。"
             )
+
+            if config:
+                AttentionManager._load_emotion_detection_config(config)
+
+                AttentionManager._load_spillover_config(config)
+
+                AttentionManager._load_fatigue_config(config)
 
             AttentionManager._storage_path = None
 
@@ -217,11 +221,21 @@ class AttentionManager:
 
         # 设置存储路径
 
-        AttentionManager._storage_path = Path(data_dir) / "attention_data.json"
+        storage_path = Path(data_dir) / "attention_data.json"
+
+        path_changed = AttentionManager._storage_path != storage_path
+
+        AttentionManager._storage_path = storage_path
 
         # 加载已有数据
 
-        AttentionManager._load_from_disk()
+        if path_changed or not AttentionManager._initialized:
+            if storage_path.exists():
+                AttentionManager._load_from_disk()
+            else:
+                AttentionManager._attention_map = {}
+            AttentionManager._conversation_activity_map = {}
+            AttentionManager._fatigue_attention_block = {}
 
         # 加载情感检测和溢出配置
 

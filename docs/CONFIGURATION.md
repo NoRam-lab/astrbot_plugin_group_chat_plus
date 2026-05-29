@@ -32,7 +32,7 @@
 | `after_reply_probability` | `0.8` | bot 回复后临时提升概率 |
 | `probability_duration` | `120` | 概率提升持续秒数 |
 | `decision_ai_prompt_mode` | `append` | 读空气额外提示词追加或覆盖默认提示词 |
-| `decision_ai_extra_prompt` | `""` | 读空气自定义提示词 |
+| `decision_ai_extra_prompt` | 上下文/氛围判断补充提示词 | 读空气自定义提示词，默认以 append 模式补充默认系统提示词：先理解上下文和群聊氛围，避免乱插嘴；明确邀请、直接提问或能自然接住话题时允许回复 |
 | `decision_ai_timeout` | `30` | 读空气 AI 超时秒数，超时默认不回复 |
 | `decision_ai_max_tokens` | `4` | 读空气最大输出 token，目标只返回 `yes/no` |
 | `read_air_blacklist_user_ids` | `[]` | 指定用户普通消息只记录，不主动读空气 |

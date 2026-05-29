@@ -80,23 +80,28 @@ class CooldownManager:
             data_dir: 数据目录路径（来自 StarTools.get_data_dir()）
             config: 插件配置字典（用于加载注意力冷却配置）
         """
-        if CooldownManager._initialized:
-            return
-
         if not data_dir:
             logger.error(
                 "[注意力冷却] 未提供 data_dir，持久化已禁用。"
                 "请使用 StarTools.get_data_dir() 获取数据目录。"
             )
+            if config:
+                CooldownManager._load_config(config)
             CooldownManager._storage_path = None
             CooldownManager._initialized = True
             return
 
         # 设置存储路径
-        CooldownManager._storage_path = Path(data_dir) / "cooldown_data.json"
+        storage_path = Path(data_dir) / "cooldown_data.json"
+        path_changed = CooldownManager._storage_path != storage_path
+        CooldownManager._storage_path = storage_path
 
         # 加载已有数据
-        CooldownManager._load_from_disk()
+        if path_changed or not CooldownManager._initialized:
+            if storage_path.exists():
+                CooldownManager._load_from_disk()
+            else:
+                CooldownManager._cooldown_map = {}
 
         # 加载配置参数
         if config:

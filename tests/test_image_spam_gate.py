@@ -113,6 +113,44 @@ def run(coro):
     return asyncio.run(coro)
 
 
+class CountingPolicy:
+    enabled = True
+
+    def __init__(self):
+        self.register_calls = []
+
+    def register_image_batch(self, *, chat_key, image_count, timestamp):
+        self.register_calls.append((chat_key, image_count))
+        return 1.0
+
+    def batch_factor(self, image_count):
+        return 1.0
+
+    def evaluate(self, *, model_importance, burst_factor, batch_factor):
+        return SimpleNamespace(
+            to_dict=lambda: {
+                "keep": True,
+                "importance": model_importance,
+                "effective_importance": model_importance,
+                "time_factor": 1.0,
+                "burst_factor": burst_factor,
+                "batch_factor": batch_factor,
+                "threshold": 0.0,
+                "gate_reason": "test",
+                "policy_version": "test",
+            }
+        )
+
+
+class CountingSpamGate:
+    def __init__(self):
+        self.calls = 0
+
+    def evaluate(self, **_kwargs):
+        self.calls += 1
+        return SimpleNamespace(skip=False, reason="")
+
+
 def test_active_image_blacklist_skips_provider_and_marks_pending_retry():
     async def scenario():
         provider = FakeProvider()
@@ -158,6 +196,42 @@ def test_active_image_blacklist_skips_provider_and_marks_pending_retry():
                 "policy_version": "image_importance_gate_v1",
             }
         ]
+
+    run(scenario())
+
+
+def test_provider_image_path_registers_importance_and_spam_gate_once():
+    async def scenario():
+        provider = FakeProvider()
+        policy = CountingPolicy()
+        spam_gate = CountingSpamGate()
+        images = [HandlerImage("img-once.png")]
+        event = DummyEvent([HandlerPlain("看看"), *images])
+
+        should_continue, text, _, retained, statuses = await ImageHandler.process_message_images(
+            event,
+            FakeContext(provider),
+            True,
+            "all",
+            "vision",
+            "请描述图片",
+            False,
+            False,
+            timeout=3,
+            image_description_cache=None,
+            max_images_per_message=20,
+            image_importance_policy=policy,
+            image_spam_gate=spam_gate,
+            image_to_text_system_prompt="",
+        )
+
+        assert should_continue is True
+        assert "[图片内容: 一张用于测试的图片]" in text
+        assert retained is True
+        assert len(statuses) == 1
+        assert len(provider.calls) == 1
+        assert policy.register_calls == [("qq:100", 1)]
+        assert spam_gate.calls == 1
 
     run(scenario())
 

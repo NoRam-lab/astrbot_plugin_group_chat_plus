@@ -95,7 +95,10 @@ class SQLiteContextStore:
             initial_delay = 300.0
         self.maintenance_initial_delay_seconds = max(0.0, initial_delay)
 
-        self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._flush_sentinel = object()
+        self._flush_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
         self._worker_task: asyncio.Task | None = None
         self._maintenance_task: asyncio.Task | None = None
         self._maintenance_lock = asyncio.Lock()
@@ -110,42 +113,47 @@ class SQLiteContextStore:
     async def start(self) -> None:
         if self._started:
             return
-        await asyncio.to_thread(self._initialize_sync)
-        self._worker_task = asyncio.create_task(self._writer_loop())
-        # 启动周期性归档维护循环（修复：之前只有 initialize 时跑一次，导致热库不会每天归档进冷库）
-        self._next_maintenance_at = time.time() + self.maintenance_initial_delay_seconds
-        self._maintenance_task = asyncio.create_task(self._maintenance_loop())
-        self._started = True
-        logger.info(
-            "[GCP上下文存储] SQLite已启动 hot=%s cold=%s hot_retention=%sd cold_retention=%sd "
-            "maintenance_interval=%.1fh",
-            self.hot_db_path,
-            self.cold_db_path,
-            self.hot_retention_days,
-            self.cold_retention_days,
-            self.maintenance_interval_seconds / 3600.0,
-        )
+        async with self._lifecycle_lock:
+            if self._started:
+                return
+            await asyncio.to_thread(self._initialize_sync)
+            self._worker_task = asyncio.create_task(self._writer_loop())
+            # 启动周期性归档维护循环（修复：之前只有 initialize 时跑一次，导致热库不会每天归档进冷库）
+            self._next_maintenance_at = time.time() + self.maintenance_initial_delay_seconds
+            self._maintenance_task = asyncio.create_task(self._maintenance_loop())
+            self._started = True
+            logger.info(
+                "[GCP上下文存储] SQLite已启动 hot=%s cold=%s hot_retention=%sd cold_retention=%sd "
+                "maintenance_interval=%.1fh",
+                self.hot_db_path,
+                self.cold_db_path,
+                self.hot_retention_days,
+                self.cold_retention_days,
+                self.maintenance_interval_seconds / 3600.0,
+            )
 
     async def close(self) -> None:
-        if not self._started:
-            return
-        # 先停维护循环，避免它在写入队列关闭后再触发归档
-        if self._maintenance_task and not self._maintenance_task.done():
-            self._maintenance_task.cancel()
-            try:
-                await self._maintenance_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                self._record_error("maintenance_close", e)
-        self._maintenance_task = None
-        await self._queue.put(None)
-        if self._worker_task:
-            try:
-                await self._worker_task
-            except Exception as e:
-                self._record_error("writer_close", e)
-        self._started = False
+        async with self._lifecycle_lock:
+            if not self._started:
+                return
+            # 先停维护循环，避免它在写入队列关闭后再触发归档
+            if self._maintenance_task and not self._maintenance_task.done():
+                self._maintenance_task.cancel()
+                try:
+                    await self._maintenance_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    self._record_error("maintenance_close", e)
+            self._maintenance_task = None
+            await self._queue.put(None)
+            if self._worker_task:
+                try:
+                    await self._worker_task
+                except Exception as e:
+                    self._record_error("writer_close", e)
+            self._worker_task = None
+            self._started = False
 
 
     async def enqueue_message(self, message: dict[str, Any]) -> bool:
@@ -171,8 +179,12 @@ class SQLiteContextStore:
     async def flush(self) -> None:
         if not self._started:
             return
-        while not self._queue.empty():
-            await asyncio.sleep(0.05)
+        async with self._flush_lock:
+            if not self._started:
+                return
+            done = asyncio.Event()
+            await self._queue.put((self._flush_sentinel, done))
+            await done.wait()
 
     async def get_recent_messages(
         self,
@@ -440,7 +452,21 @@ class SQLiteContextStore:
                 if batch:
                     await self._flush_batch(batch)
                     batch = []
+                self._queue.task_done()
                 return
+
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and item[0] is self._flush_sentinel
+            ):
+                if batch:
+                    await self._flush_batch(batch)
+                    batch = []
+                    last_flush = time.time()
+                item[1].set()
+                self._queue.task_done()
+                continue
 
             if item != "__timeout__":
                 batch.append(item)
@@ -1205,6 +1231,8 @@ class SQLiteContextStore:
             return [("hot", self.hot_db_path)]
         if scope == "cold":
             return [("cold", self.cold_db_path)]
+        if scope != "all":
+            raise ValueError("db_scope 必须是 hot、cold 或 all")
         return [("hot", self.hot_db_path), ("cold", self.cold_db_path)]
 
     def _message_row_to_dict(self, row: sqlite3.Row, db_name: str) -> dict[str, Any]:

@@ -117,6 +117,7 @@ def load_chatplus_class():
         "ContextManager",
         "DecisionAI",
         "ReplyHandler",
+        "ReplyHandlerDKQ",
         "MemoryInjector",
         "ToolsReminder",
         "KeywordChecker",
@@ -313,6 +314,83 @@ def test_read_air_blacklist_matches_and_only_applies_to_plain_messages():
     ) is False
 
 
+def test_read_air_reply_handler_routing_only_for_plain_read_air():
+    assert (
+        ChatPlus._should_use_read_air_reply_handler(
+            is_at_message=False,
+            has_trigger_keyword=False,
+            is_reply_to_bot=False,
+            poke_info=None,
+            is_welcome_skip_all=False,
+        )
+        is True
+    )
+    assert (
+        ChatPlus._should_use_read_air_reply_handler(is_at_message=True) is False
+    )
+    assert (
+        ChatPlus._should_use_read_air_reply_handler(has_trigger_keyword=True)
+        is False
+    )
+    assert (
+        ChatPlus._should_use_read_air_reply_handler(is_reply_to_bot=True) is False
+    )
+    assert (
+        ChatPlus._should_use_read_air_reply_handler(
+            poke_info={"is_poke_bot": True}
+        )
+        is False
+    )
+    assert (
+        ChatPlus._should_use_read_air_reply_handler(is_welcome_skip_all=True)
+        is False
+    )
+
+
+def test_reply_blacklists_match_string_and_numeric_ids(monkeypatch):
+    plugin = ChatPlus.__new__(ChatPlus)
+    plugin.debug_mode = False
+    plugin.enable_reply_silent_blacklist = True
+    plugin.reply_silent_blacklist_user_ids = ChatPlus._normalize_user_id_set(
+        ["10001", 20002]
+    )
+    plugin.enable_reply_probability_blacklist = True
+    plugin.reply_probability_blacklist_user_ids = ChatPlus._normalize_user_id_set(
+        ["30003", 40004]
+    )
+    plugin.reply_probability_blacklist_rate = 0.2
+
+    assert plugin._is_reply_silent_blacklisted(DummyEvent(sender_id="10001")) is True
+    assert plugin._is_reply_silent_blacklisted(DummyEvent(sender_id=20002)) is True
+    assert plugin._is_reply_silent_blacklisted(DummyEvent(sender_id="30003")) is False
+    assert (
+        plugin._is_reply_probability_blacklisted(DummyEvent(sender_id="30003"))
+        is True
+    )
+    assert (
+        plugin._is_reply_probability_blacklisted(DummyEvent(sender_id=40004))
+        is True
+    )
+    assert (
+        plugin._is_reply_probability_blacklisted(DummyEvent(sender_id="10001"))
+        is False
+    )
+
+    plugin.reply_probability_blacklist_rate = 0.0
+    assert plugin._should_block_reply_by_probability_blacklist(
+        DummyEvent(sender_id="30003")
+    ) is True
+    plugin.reply_probability_blacklist_rate = 1.0
+    assert plugin._should_block_reply_by_probability_blacklist(
+        DummyEvent(sender_id="30003")
+    ) is False
+    plugin.reply_probability_blacklist_rate = 0.2
+    monkeypatch.setattr(main_module.random, "random", lambda: 0.9)
+    assert plugin._should_block_reply_by_probability_blacklist(
+        DummyEvent(sender_id="30003")
+    ) is True
+
+
 def test_record_filtered_user_message_uses_source_and_probability_flag(monkeypatch):
     async def scenario():
         plugin = ChatPlus.__new__(ChatPlus)
@@ -350,6 +428,31 @@ def test_record_filtered_user_message_uses_source_and_probability_flag(monkeypat
         assert saved[0][0]["image_refs"] == []
 
     run(scenario())
+
+
+def test_get_message_id_prefers_platform_message_id():
+    plugin = ChatPlus.__new__(ChatPlus)
+    event = DummyEvent(content="same")
+
+    assert plugin._get_message_id(event) == "aiocqhttp_msg-1"
+    assert plugin._get_message_id(event) == "aiocqhttp_msg-1"
+
+
+def test_get_message_id_fallback_is_stable_but_distinguishes_real_messages():
+    plugin = ChatPlus.__new__(ChatPlus)
+    event_a = DummyEvent(content="same text")
+    event_b = DummyEvent(content="same text")
+    event_a.message_obj.message_id = ""
+    event_b.message_obj.message_id = ""
+    event_a.message_obj.timestamp = 1000.001
+    event_b.message_obj.timestamp = 1000.002
+
+    id_a = plugin._get_message_id(event_a)
+    id_b = plugin._get_message_id(event_b)
+
+    assert id_a == plugin._get_message_id(event_a)
+    assert id_b == plugin._get_message_id(event_b)
+    assert id_a != id_b
 
 
 def test_command_filter_records_only_when_enabled():
@@ -461,3 +564,444 @@ def test_process_message_read_air_blacklist_records_and_returns_before_probabili
         assert recorded == ["read_air_blacklisted"]
 
     run(scenario())
+
+
+def test_process_message_reply_silent_blacklist_saves_before_reply_checks(monkeypatch):
+    async def scenario():
+        plugin = ChatPlus.__new__(ChatPlus)
+        plugin.debug_mode = False
+        plugin.enable_performance_timing_log = False
+        plugin.frequency_adjuster_enabled = False
+        plugin.frequency_adjuster = None
+        plugin.enable_reply_silent_blacklist = True
+        plugin.reply_silent_blacklist_user_ids = ChatPlus._normalize_user_id_set(
+            ["10001"]
+        )
+        plugin.enable_group_wait_window = False
+        plugin._group_wait_window_max_extra = 0
+        plugin.enable_emoji_filter = False
+        plugin._get_message_id = lambda _event: "silent-1"
+        plugin._get_runtime_chat_key = lambda *_args, **_kwargs: "chat-key"
+        plugin._build_message_trace = lambda _event, _chat_id: {
+            "message_id": "silent-1",
+            "started_at": 0,
+            "steps": [],
+        }
+        plugin._set_message_trace = lambda *_args, **_kwargs: None
+        plugin._trace_step = lambda *_args, **_kwargs: None
+        plugin._trace_summary = lambda *_args, **_kwargs: None
+        plugin._check_poke_message = lambda _event: {
+            "is_poke": False,
+            "should_ignore": False,
+        }
+        plugin._should_absorb_wait_window_messages = lambda: False
+        plugin._cancel_background_task = lambda *_args, **_kwargs: None
+
+        async def fake_initial(_event):
+            return True, "aiocqhttp", False, "group-1"
+
+        async def fake_triggers(_event):
+            return True, True, "bot"
+
+        async def fake_mention(_event):
+            return {}
+
+        async def fake_content(*_args, **_kwargs):
+            return (
+                True,
+                "hello bot",
+                "hello bot",
+                "formatted",
+                "decision formatted",
+                [],
+                [],
+                [],
+                {"content": "hello bot", "message_id": "silent-1"},
+                False,
+            )
+
+        saved = []
+
+        async def fake_save(_event, cached_message, *, source=""):
+            saved.append((source, cached_message))
+            return True
+
+        plugin._perform_initial_checks = fake_initial
+        plugin._check_message_triggers = fake_triggers
+        plugin._is_reply_to_bot_message = lambda _event: False
+        plugin._check_probability_before_processing = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("probability should not run")
+        )
+        plugin._process_message_content = fake_content
+        plugin._check_ai_decision = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ai decision should not run")
+        )
+        plugin._check_mention_others = fake_mention
+        monkeypatch.setattr(
+            main_module.ContextManager,
+            "save_cached_user_message",
+            fake_save,
+            raising=False,
+        )
+
+        async for _ in plugin._process_message(
+            DummyEvent(sender_id="10001", content="hello bot")
+        ):
+            pass
+
+        assert saved == [("current_message", {"content": "hello bot", "message_id": "silent-1"})]
+
+    run(scenario())
+
+
+def test_process_message_reply_probability_blacklist_blocks_after_save(monkeypatch):
+    async def scenario(rate, roll):
+        plugin = ChatPlus.__new__(ChatPlus)
+        plugin.debug_mode = False
+        plugin.enable_performance_timing_log = False
+        plugin.frequency_adjuster_enabled = False
+        plugin.frequency_adjuster = None
+        plugin.enable_reply_silent_blacklist = False
+        plugin.reply_silent_blacklist_user_ids = set()
+        plugin.enable_reply_probability_blacklist = True
+        plugin.reply_probability_blacklist_user_ids = ChatPlus._normalize_user_id_set(
+            ["10001"]
+        )
+        plugin.reply_probability_blacklist_rate = rate
+        plugin.enable_group_wait_window = False
+        plugin._group_wait_window_max_extra = 0
+        plugin.enable_emoji_filter = False
+        plugin.runtime_snapshots = types.SimpleNamespace(
+            put=lambda *_args, **_kwargs: None,
+            discard=lambda *_args, **_kwargs: None,
+        )
+        plugin._get_message_id = lambda _event: "prob-1"
+        plugin._get_runtime_chat_key = lambda *_args, **_kwargs: "chat-key"
+        plugin._build_message_trace = lambda _event, _chat_id: {
+            "message_id": "prob-1",
+            "started_at": 0,
+            "steps": [],
+        }
+        plugin._set_message_trace = lambda *_args, **_kwargs: None
+        plugin._trace_step = lambda *_args, **_kwargs: None
+        plugin._trace_summary = lambda *_args, **_kwargs: None
+        plugin._check_poke_message = lambda _event: {
+            "is_poke": False,
+            "should_ignore": False,
+        }
+        plugin._should_absorb_wait_window_messages = lambda: False
+        plugin._cancel_background_task = lambda *_args, **_kwargs: None
+
+        async def fake_initial(_event):
+            return True, "aiocqhttp", False, "group-1"
+
+        async def fake_triggers(_event):
+            return True, True, "bot"
+
+        async def fake_probability(*_args, **_kwargs):
+            return True
+
+        async def fake_mention(_event):
+            return {}
+
+        async def fake_content(*_args, **_kwargs):
+            return (
+                True,
+                "hello bot",
+                "hello bot",
+                "formatted",
+                "decision formatted",
+                [],
+                [],
+                [],
+                {"content": "hello bot", "message_id": "prob-1"},
+                False,
+            )
+
+        saved = []
+        ai_calls = []
+
+        async def fake_save(_event, cached_message, *, source=""):
+            saved.append((source, cached_message))
+            return True
+
+        async def fake_ai_decision(*_args, **_kwargs):
+            ai_calls.append(True)
+            return False
+
+        plugin._perform_initial_checks = fake_initial
+        plugin._check_message_triggers = fake_triggers
+        plugin._is_reply_to_bot_message = lambda _event: False
+        plugin._check_probability_before_processing = fake_probability
+        plugin._check_mention_others = fake_mention
+        plugin._process_message_content = fake_content
+        plugin._check_ai_decision = fake_ai_decision
+        monkeypatch.setattr(
+            main_module.ContextManager,
+            "save_cached_user_message",
+            fake_save,
+            raising=False,
+        )
+        monkeypatch.setattr(main_module.random, "random", lambda: roll)
+        monkeypatch.setattr(
+            main_module.ReplyHandler,
+            "check_if_already_replied",
+            staticmethod(lambda _event: False),
+            raising=False,
+        )
+
+        async for _ in plugin._process_message(
+            DummyEvent(sender_id="10001", content="@bot hello")
+        ):
+            pass
+
+        return saved, ai_calls
+
+    saved_zero, ai_zero = run(scenario(0.0, 0.0))
+    saved_one, ai_one = run(scenario(1.0, 0.99))
+    saved_roll, ai_roll = run(scenario(0.2, 0.9))
+
+    assert saved_zero == [("current_message", {"content": "hello bot", "message_id": "prob-1"})]
+    assert ai_zero == []
+    assert saved_one == [("current_message", {"content": "hello bot", "message_id": "prob-1"})]
+    assert ai_one == [True]
+    assert saved_roll == [("current_message", {"content": "hello bot", "message_id": "prob-1"})]
+    assert ai_roll == []
+
+
+def test_process_message_superseded_after_content_saves_user_without_reply(monkeypatch):
+    async def scenario():
+        plugin = ChatPlus.__new__(ChatPlus)
+        plugin.debug_mode = False
+        plugin.enable_performance_timing_log = False
+        plugin.frequency_adjuster_enabled = False
+        plugin.frequency_adjuster = None
+        plugin.enable_reply_silent_blacklist = False
+        plugin.reply_silent_blacklist_user_ids = set()
+        plugin.enable_reply_probability_blacklist = False
+        plugin.reply_probability_blacklist_user_ids = set()
+        plugin.enable_group_wait_window = False
+        plugin._group_wait_window_max_extra = 0
+        plugin.enable_emoji_filter = False
+        plugin.runtime_snapshots = types.SimpleNamespace(
+            put=lambda *_args, **_kwargs: None,
+            discard=lambda *_args, **_kwargs: None,
+        )
+        plugin.raw_reply_cache = {}
+        plugin._pending_bot_replies = {}
+        plugin._duplicate_blocked_messages = {}
+        plugin._agent_done_flags = set()
+        plugin.wait_window_buffer = types.SimpleNamespace(clear=lambda *_args: 0)
+        plugin._active_reply_flows = {}
+        plugin._superseded_reply_message_ids = set()
+        plugin._superseded_reply_flow_times = {}
+        plugin._get_message_id = lambda _event: "old-image-1"
+        plugin._get_runtime_chat_key = lambda *_args, **_kwargs: "chat-key"
+        plugin._build_message_trace = lambda _event, _chat_id: {
+            "message_id": "old-image-1",
+            "started_at": 0,
+            "steps": [],
+        }
+        plugin._set_message_trace = lambda *_args, **_kwargs: None
+        plugin._trace_step = lambda *_args, **_kwargs: None
+        plugin._trace_summary = lambda *_args, **_kwargs: None
+        plugin._check_poke_message = lambda _event: {
+            "is_poke": False,
+            "should_ignore": False,
+        }
+        plugin._should_absorb_wait_window_messages = lambda: False
+        plugin._cancel_background_task = lambda *_args, **_kwargs: None
+
+        async def fake_initial(_event):
+            return True, "aiocqhttp", False, "group-1"
+
+        async def fake_triggers(_event):
+            return False, False, ""
+
+        async def fake_probability(*_args, **_kwargs):
+            return True
+
+        async def fake_mention(_event):
+            return {}
+
+        async def fake_content(*_args, **_kwargs):
+            plugin._superseded_reply_message_ids.add("old-image-1")
+            plugin._superseded_reply_flow_times["old-image-1"] = 123.0
+            return (
+                True,
+                "old image",
+                "old image",
+                "formatted",
+                "decision formatted",
+                ["img-ref"],
+                [],
+                [],
+                {"content": "old image", "message_id": "old-image-1"},
+                False,
+            )
+
+        saved = []
+
+        async def fake_save(_event, cached_message, *, source=""):
+            saved.append((source, cached_message))
+            return True
+
+        plugin._perform_initial_checks = fake_initial
+        plugin._check_message_triggers = fake_triggers
+        plugin._is_reply_to_bot_message = lambda _event: False
+        plugin._check_probability_before_processing = fake_probability
+        plugin._check_mention_others = fake_mention
+        plugin._process_message_content = fake_content
+        plugin._check_ai_decision = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ai decision should not run")
+        )
+        monkeypatch.setattr(
+            main_module.ContextManager,
+            "save_cached_user_message",
+            fake_save,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            main_module.ReplyHandler,
+            "check_if_already_replied",
+            staticmethod(lambda _event: False),
+            raising=False,
+        )
+
+        yielded = []
+        async for result in plugin._process_message(DummyEvent(content="old image")):
+            yielded.append(result)
+
+        assert yielded == []
+        assert saved == [
+            (
+                "superseded_context_build",
+                {"content": "old image", "message_id": "old-image-1"},
+            )
+        ]
+        assert "old-image-1" not in plugin._active_reply_flows
+        assert "old-image-1" not in plugin._superseded_reply_message_ids
+
+    run(scenario())
+
+
+def test_strong_trigger_supersedes_prior_flow_before_probability_gate():
+    async def scenario():
+        plugin = ChatPlus.__new__(ChatPlus)
+        plugin.debug_mode = False
+        plugin.enable_performance_timing_log = False
+        plugin.frequency_adjuster_enabled = False
+        plugin.frequency_adjuster = None
+        plugin.enable_reply_silent_blacklist = False
+        plugin.reply_silent_blacklist_user_ids = set()
+        plugin.enable_group_wait_window = False
+        plugin._group_wait_window_max_extra = 0
+        plugin.enable_emoji_filter = False
+        plugin._group_wait_window_lock = asyncio.Lock()
+        plugin._group_wait_windows = {}
+        plugin.wait_window_buffer = types.SimpleNamespace(clear=lambda *_args: 0)
+        plugin._active_reply_flows = {}
+        plugin._superseded_reply_message_ids = set()
+        plugin._superseded_reply_flow_times = {}
+        plugin._get_message_id = lambda _event: "new-at-1"
+        plugin._get_runtime_chat_key = lambda *_args, **_kwargs: "chat-key"
+        plugin._build_message_trace = lambda _event, _chat_id: {
+            "message_id": "new-at-1",
+            "started_at": 0,
+            "steps": [],
+        }
+        plugin._set_message_trace = lambda *_args, **_kwargs: None
+        plugin._trace_step = lambda *_args, **_kwargs: None
+        plugin._trace_summary = lambda *_args, **_kwargs: None
+        plugin._check_poke_message = lambda _event: {
+            "is_poke": False,
+            "should_ignore": False,
+        }
+        plugin._should_absorb_wait_window_messages = lambda: False
+        plugin._cancel_background_task = lambda *_args, **_kwargs: None
+        plugin._active_reply_flows["old-normal-1"] = {
+            "runtime_chat_key": "chat-key",
+            "trigger_kind": "normal",
+            "sender_id": "10001",
+            "stage": "context_build",
+            "started_at": 10.0,
+            "updated_at": 10.0,
+        }
+
+        async def fake_initial(_event):
+            return True, "aiocqhttp", False, "group-1"
+
+        async def fake_triggers(_event):
+            return True, False, ""
+
+        async def fake_probability(*_args, **_kwargs):
+            return False
+
+        plugin._perform_initial_checks = fake_initial
+        plugin._check_message_triggers = fake_triggers
+        plugin._is_reply_to_bot_message = lambda _event: False
+        plugin._check_probability_before_processing = fake_probability
+        plugin._check_mention_others = lambda _event: (_ for _ in ()).throw(
+            AssertionError("content path should not run")
+        )
+
+        yielded = []
+        async for result in plugin._process_message(DummyEvent(content="@bot hello")):
+            yielded.append(result)
+
+        assert yielded == []
+        assert plugin._is_reply_flow_superseded("old-normal-1") is True
+        assert plugin._is_reply_flow_superseded("new-at-1") is False
+
+    run(scenario())
+
+
+def test_multimodal_image_collection_disabled_by_default():
+    plugin = ChatPlus.__new__(ChatPlus)
+    plugin.enable_reply_multimodal_image_mode = False
+    plugin.max_images_per_message = 10
+
+    images = plugin._collect_reply_multimodal_image_urls(
+        {"image_refs": ["current-1"]},
+        [{"image_refs": ["window-1"]}],
+    )
+
+    assert images == []
+
+
+def test_multimodal_image_collection_uses_current_then_wait_window_only():
+    plugin = ChatPlus.__new__(ChatPlus)
+    plugin.enable_reply_multimodal_image_mode = True
+    plugin.max_images_per_message = 3
+
+    images = plugin._collect_reply_multimodal_image_urls(
+        {
+            "image_refs": ["current-1", "current-2"],
+            "history_image_refs": ["history-should-not-leak"],
+        },
+        [
+            {
+                "timestamp": 30,
+                "image_refs": ["window-late", "current-1"],
+                "history_image_refs": ["history-should-not-leak-2"],
+            },
+            {
+                "timestamp": 20,
+                "image_urls": ["window-early"],
+            },
+        ],
+    )
+
+    assert images == ["current-1", "current-2", "window-early"]
+
+
+def test_multimodal_original_image_hint_is_added_once():
+    plugin = ChatPlus.__new__(ChatPlus)
+
+    text = plugin._append_multimodal_original_image_hint("formatted context", ["img-1"])
+    text_again = plugin._append_multimodal_original_image_hint(text, ["img-1"])
+
+    assert text_again == text
+    assert "本轮 LLM 请求附带了当前触发消息及等待窗口追加消息中的原始图片" in text
+    assert "文字图片描述仅作为兜底参考" in text
+    assert plugin._append_multimodal_original_image_hint("formatted context", []) == "formatted context"
